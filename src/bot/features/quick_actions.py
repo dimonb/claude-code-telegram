@@ -122,12 +122,12 @@ class QuickActionManager:
         }
 
     async def get_suggestions(
-        self, session: SessionModel, limit: int = 6
+        self, session: Optional[SessionModel] = None, limit: int = 6
     ) -> List[QuickAction]:
         """Get quick action suggestions based on session context.
 
         Args:
-            session: Current session
+            session: Optional current session (can be None)
             limit: Maximum number of suggestions
 
         Returns:
@@ -151,11 +151,11 @@ class QuickActionManager:
             self.logger.error(f"Error getting suggestions: {e}")
             return []
 
-    async def _analyze_context(self, session: SessionModel) -> Dict[str, Any]:
+    async def _analyze_context(self, session: Optional[SessionModel]) -> Dict[str, Any]:
         """Analyze session context to determine available actions.
 
         Args:
-            session: Current session
+            session: Optional current session
 
         Returns:
             Context dictionary
@@ -169,33 +169,23 @@ class QuickActionManager:
             "has_dependencies": False,
         }
 
-        # Analyze recent messages for context clues
-        if session.context:
-            recent_messages = session.context.get("recent_messages", [])
-            for msg in recent_messages:
-                content = msg.get("content", "").lower()
+        # For now, we'll use simple heuristics
+        # In the future, this could be enhanced with:
+        # - File system analysis (check for package.json, requirements.txt, etc.)
+        # - Message history analysis from storage
+        # - Project-specific configuration
 
-                # Check for test indicators
-                if any(word in content for word in ["test", "pytest", "unittest"]):
-                    context["has_tests"] = True
+        if session:
+            # Basic context from session
+            # Could analyze project_path for common patterns
+            project_path = str(session.project_path).lower()
 
-                # Check for package manager indicators
-                if any(word in content for word in ["pip", "poetry", "npm", "yarn"]):
-                    context["has_package_manager"] = True
-                    context["has_dependencies"] = True
+            # Check for common project indicators
+            if any(indicator in project_path for indicator in ["test", "spec"]):
+                context["has_tests"] = True
 
-                # Check for formatter indicators
-                if any(word in content for word in ["black", "prettier", "format"]):
-                    context["has_formatter"] = True
-
-                # Check for linter indicators
-                if any(
-                    word in content for word in ["flake8", "pylint", "eslint", "mypy"]
-                ):
-                    context["has_linter"] = True
-
-        # File-based context analysis could be added here
-        # For now, we'll use heuristics based on session history
+            if session.message_count > 0:
+                context["has_dependencies"] = True
 
         return context
 
@@ -264,7 +254,7 @@ class QuickActionManager:
             raise ValueError(f"Unknown action: {action_id}")
 
         self.logger.info(
-            f"Executing quick action: {action.name} for session {session.id}"
+            f"Executing quick action: {action.name} for session {session.session_id}"
         )
 
         # Return the command - actual execution is handled by the bot

@@ -797,9 +797,8 @@ async def quick_actions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             return
 
         # Get context-aware actions
-        actions = await quick_action_manager.get_suggestions(
-            session_data={"working_directory": str(current_dir), "user_id": user_id}
-        )
+        # TODO: Pass actual SessionModel from storage when available
+        actions = await quick_action_manager.get_suggestions(session=None)
 
         if not actions:
             await update.message.reply_text(
@@ -813,7 +812,7 @@ async def quick_actions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             return
 
         # Create inline keyboard
-        keyboard = quick_action_manager.create_inline_keyboard(actions, max_columns=2)
+        keyboard = quick_action_manager.create_inline_keyboard(actions, columns=2)
 
         relative_path = current_dir.relative_to(settings.approved_directory)
         await update.message.reply_text(

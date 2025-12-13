@@ -37,6 +37,7 @@ async def handle_callback_query(
             "action": handle_action_callback,
             "confirm": handle_confirm_callback,
             "quick": handle_quick_action_callback,
+            "quick_action": handle_quick_action_callback,  # Support both formats
             "followup": handle_followup_callback,
             "conversation": handle_conversation_callback,
             "git": handle_git_callback,
@@ -519,6 +520,8 @@ async def _handle_continue_action(query, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def _handle_status_action(query, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle status action."""
+    from telegram.error import BadRequest
+
     # This essentially duplicates the /status command functionality
     user_id = query.from_user.id
     settings: Settings = context.bot_data["settings"]
@@ -591,13 +594,22 @@ async def _handle_status_action(query, context: ContextTypes.DEFAULT_TYPE) -> No
 
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    await query.edit_message_text(
-        "\n".join(status_lines), parse_mode="Markdown", reply_markup=reply_markup
-    )
+    try:
+        await query.edit_message_text(
+            "\n".join(status_lines), parse_mode="Markdown", reply_markup=reply_markup
+        )
+    except BadRequest as e:
+        # If message is not modified, just answer the callback
+        if "message is not modified" in str(e).lower():
+            await query.answer("✅ Status is up to date")
+        else:
+            raise
 
 
 async def _handle_ls_action(query, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle ls action."""
+    from telegram.error import BadRequest
+
     settings: Settings = context.bot_data["settings"]
     current_dir = context.user_data.get(
         "current_directory", settings.approved_directory
@@ -659,12 +671,24 @@ async def _handle_ls_action(query, context: ContextTypes.DEFAULT_TYPE) -> None:
 
         reply_markup = InlineKeyboardMarkup(keyboard)
 
-        await query.edit_message_text(
-            message, parse_mode="Markdown", reply_markup=reply_markup
-        )
+        try:
+            await query.edit_message_text(
+                message, parse_mode="Markdown", reply_markup=reply_markup
+            )
+        except BadRequest as e:
+            # If message is not modified, just answer the callback
+            if "message is not modified" in str(e).lower():
+                await query.answer("✅ Directory is up to date")
+            else:
+                raise
 
     except Exception as e:
-        await query.edit_message_text(f"❌ Error listing directory: {str(e)}")
+        error_message = f"❌ Error listing directory: {str(e)}"
+        try:
+            await query.edit_message_text(error_message)
+        except BadRequest:
+            # If we can't edit, send as a popup
+            await query.answer(error_message, show_alert=True)
 
 
 async def _handle_start_coding_action(
@@ -687,31 +711,57 @@ async def _handle_quick_actions_action(
     query, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     """Handle quick actions menu."""
-    keyboard = [
-        [
-            InlineKeyboardButton("🧪 Run Tests", callback_data="quick:test"),
-            InlineKeyboardButton("📦 Install Deps", callback_data="quick:install"),
-        ],
-        [
-            InlineKeyboardButton("🎨 Format Code", callback_data="quick:format"),
-            InlineKeyboardButton("🔍 Find TODOs", callback_data="quick:find_todos"),
-        ],
-        [
-            InlineKeyboardButton("🔨 Build", callback_data="quick:build"),
-            InlineKeyboardButton("🚀 Start Server", callback_data="quick:start"),
-        ],
-        [
-            InlineKeyboardButton("📊 Git Status", callback_data="quick:git_status"),
-            InlineKeyboardButton("🔧 Lint Code", callback_data="quick:lint"),
-        ],
-        [InlineKeyboardButton("⬅️ Back", callback_data="action:new_session")],
+    settings: Settings = context.bot_data["settings"]
+
+    # Get quick actions from features
+    features = context.bot_data.get("features")
+    if not features or not features.is_enabled("quick_actions"):
+        await query.edit_message_text(
+            "❌ **Quick Actions Disabled**\n\n"
+            "Quick actions feature is not enabled."
+        )
+        return
+
+    quick_action_manager = features.get_quick_actions()
+    if not quick_action_manager:
+        await query.edit_message_text(
+            "❌ **Quick Actions Unavailable**\n\n"
+            "Quick actions service is not available."
+        )
+        return
+
+    # Get context-aware actions
+    actions = await quick_action_manager.get_suggestions(session=None)
+
+    if not actions:
+        await query.edit_message_text(
+            "🤖 **No Actions Available**\n\n"
+            "No quick actions are available for the current context.\n\n"
+            "**Try:**\n"
+            "• Navigating to a project directory\n"
+            "• Creating some code files\n"
+            "• Starting a Claude session"
+        )
+        return
+
+    # Create inline keyboard from actions
+    keyboard_buttons = quick_action_manager.create_inline_keyboard(actions, columns=2)
+
+    # Add back button
+    keyboard = keyboard_buttons.inline_keyboard + [
+        [InlineKeyboardButton("⬅️ Back", callback_data="action:new_session")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
+    current_dir = context.user_data.get(
+        "current_directory", settings.approved_directory
+    )
+    relative_path = current_dir.relative_to(settings.approved_directory)
+
     await query.edit_message_text(
-        "🛠️ **Quick Actions**\n\n"
-        "Choose a common development task:\n\n"
-        "_Note: These will be fully functional once Claude Code integration is complete._",
+        f"⚡ **Quick Actions**\n\n"
+        f"📂 Context: `{relative_path}/`\n\n"
+        f"Select an action to execute:",
         parse_mode="Markdown",
         reply_markup=reply_markup,
     )
@@ -749,8 +799,9 @@ async def handle_quick_action_callback(
     """Handle quick action callbacks."""
     user_id = query.from_user.id
 
-    # Get quick actions manager from bot data if available
-    quick_actions = context.bot_data.get("quick_actions")
+    # Get quick actions manager from features
+    features = context.bot_data.get("features")
+    quick_actions = features.get_quick_actions() if features else None
 
     if not quick_actions:
         await query.edit_message_text(
@@ -774,6 +825,20 @@ async def handle_quick_action_callback(
     )
 
     try:
+        # Check if this is a special action that should be redirected
+        if action_id == "git_status":
+            # Redirect to git handler
+            await handle_git_callback(query, "status", context)
+            return
+        elif action_id in ["find_todos", "build", "start"]:
+            # These are legacy actions that aren't implemented yet
+            await query.edit_message_text(
+                f"🚧 **Action Not Implemented**\n\n"
+                f"The '{action_id}' action is not yet implemented.\n\n"
+                f"You can ask Claude to help with this task by sending a message."
+            )
+            return
+
         # Get the action from the manager
         action = quick_actions.actions.get(action_id)
         if not action:
@@ -793,7 +858,7 @@ async def handle_quick_action_callback(
 
         # Run the action through Claude
         claude_response = await claude_integration.run_command(
-            prompt=action.prompt, working_directory=current_dir, user_id=user_id
+            prompt=action.command, working_directory=current_dir, user_id=user_id
         )
 
         if claude_response:
