@@ -381,7 +381,7 @@ async def list_files(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         if audit_logger:
             await audit_logger.log_command(user_id, "ls", [], False)
 
-        logger.error("Error in list_files command", error=str(e), user_id=user_id)
+        logger.exception("Error in list_files command", error=str(e), user_id=user_id)
 
 
 async def change_directory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
