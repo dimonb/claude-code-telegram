@@ -315,15 +315,17 @@ async def list_files(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 continue
 
             if item.is_dir():
-                directories.append(f"📁 {item.name}/")
+                directories.append(f"📁 {_escape_markdown(item.name)}/")
             else:
                 # Get file size
                 try:
                     size = item.stat().st_size
                     size_str = _format_file_size(size)
-                    files.append(f"📄 {item.name} ({size_str})")
+                    files.append(
+                        f"📄 {_escape_markdown(item.name)} ({size_str})"
+                    )
                 except OSError:
-                    files.append(f"📄 {item.name}")
+                    files.append(f"📄 {_escape_markdown(item.name)}")
 
         # Combine directories first, then files
         items = directories + files
@@ -926,3 +928,11 @@ def _format_file_size(size: int) -> str:
             return f"{size:.1f}{unit}" if unit != "B" else f"{size}B"
         size /= 1024
     return f"{size:.1f}TB"
+
+
+def _escape_markdown(text: str) -> str:
+    """Escape special characters for Telegram Markdown parse mode."""
+    escape_chars = r"\_*`["
+    for ch in escape_chars:
+        text = text.replace(ch, f"\\{ch}")
+    return text
