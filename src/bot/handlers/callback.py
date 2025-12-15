@@ -55,7 +55,7 @@ async def handle_callback_query(
             )
 
     except Exception as e:
-        logger.error(
+        logger.exception(
             "Error handling callback query",
             error=str(e),
             user_id=user_id,
@@ -301,6 +301,7 @@ async def _handle_show_projects_action(
 
     except Exception as e:
         await query.edit_message_text(f"❌ Error loading projects: {str(e)}")
+        logger.exception("Error in _handle_show_projects_action", error=str(e))
 
 
 async def _handle_new_session_action(query, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -500,7 +501,7 @@ async def _handle_continue_action(query, context: ContextTypes.DEFAULT_TYPE) -> 
             )
 
     except Exception as e:
-        logger.error("Error in continue action", error=str(e), user_id=user_id)
+        logger.exception("Error in continue action", error=str(e), user_id=user_id)
         await query.edit_message_text(
             f"❌ **Error Continuing Session**\n\n"
             f"An error occurred: `{str(e)}`\n\n"
@@ -611,6 +612,7 @@ async def _handle_ls_action(query, context: ContextTypes.DEFAULT_TYPE) -> None:
     from telegram.error import BadRequest
 
     settings: Settings = context.bot_data["settings"]
+    user_id = query.from_user.id
     current_dir = context.user_data.get(
         "current_directory", settings.approved_directory
     )
@@ -626,22 +628,25 @@ async def _handle_ls_action(query, context: ContextTypes.DEFAULT_TYPE) -> None:
                 continue
 
             if item.is_dir():
-                directories.append(f"📁 {item.name}/")
+                directories.append(f"📁 {_escape_markdown(item.name)}/")
             else:
                 try:
                     size = item.stat().st_size
                     size_str = _format_file_size(size)
-                    files.append(f"📄 {item.name} ({size_str})")
+                    files.append(
+                        f"📄 {_escape_markdown(item.name)} ({size_str})"
+                    )
                 except OSError:
-                    files.append(f"📄 {item.name}")
+                    files.append(f"📄 {_escape_markdown(item.name)}")
 
         items = directories + files
         relative_path = current_dir.relative_to(settings.approved_directory)
+        escaped_path = _escape_markdown(str(relative_path))
 
         if not items:
-            message = f"📂 `{relative_path}/`\n\n_(empty directory)_"
+            message = f"📂 `{escaped_path}/`\n\n_(empty directory)_"
         else:
-            message = f"📂 `{relative_path}/`\n\n"
+            message = f"📂 `{escaped_path}/`\n\n"
             max_items = 30  # Limit for inline display
             if len(items) > max_items:
                 shown_items = items[:max_items]
@@ -684,6 +689,11 @@ async def _handle_ls_action(query, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     except Exception as e:
         error_message = f"❌ Error listing directory: {str(e)}"
+        logger.exception(
+            "Error in ls action",
+            error=str(e),
+            user_id=user_id,
+        )
         try:
             await query.edit_message_text(error_message)
         except BadRequest:
@@ -878,7 +888,7 @@ async def handle_quick_action_callback(
             )
 
     except Exception as e:
-        logger.error("Quick action execution failed", error=str(e), user_id=user_id)
+        logger.exception("Quick action execution failed", error=str(e), user_id=user_id)
         await query.edit_message_text(
             f"❌ **Action Error**\n\n"
             f"An error occurred while executing {action_id}: {str(e)}"
@@ -921,7 +931,7 @@ async def handle_followup_callback(
         )
 
     except Exception as e:
-        logger.error(
+        logger.exception(
             "Error handling follow-up callback",
             error=str(e),
             user_id=user_id,
@@ -1126,7 +1136,7 @@ async def handle_git_callback(
             )
 
     except Exception as e:
-        logger.error(
+        logger.exception(
             "Error in git callback",
             error=str(e),
             git_action=git_action,
@@ -1203,7 +1213,7 @@ async def handle_export_callback(
         )
 
     except Exception as e:
-        logger.error(
+        logger.exception(
             "Export failed", error=str(e), user_id=user_id, format=export_format
         )
         await query.edit_message_text(f"❌ **Export Failed**\n\n{str(e)}")
@@ -1216,3 +1226,11 @@ def _format_file_size(size: int) -> str:
             return f"{size:.1f}{unit}" if unit != "B" else f"{size}B"
         size /= 1024
     return f"{size:.1f}TB"
+
+
+def _escape_markdown(text: str) -> str:
+    """Escape special characters for Telegram Markdown parse mode."""
+    escape_chars = r"\_*`["
+    for ch in escape_chars:
+        text = text.replace(ch, f"\\{ch}")
+    return text

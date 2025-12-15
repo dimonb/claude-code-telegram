@@ -44,7 +44,7 @@ class FeatureRegistry:
                 )
                 logger.info("File handler feature enabled")
             except Exception as e:
-                logger.error("Failed to initialize file handler", error=str(e))
+                logger.exception("Failed to initialize file handler", error=str(e))
 
         # Git integration - conditionally enabled
         if self.config.enable_git_integration:
@@ -52,7 +52,7 @@ class FeatureRegistry:
                 self.features["git"] = GitIntegration(settings=self.config)
                 logger.info("Git integration feature enabled")
             except Exception as e:
-                logger.error("Failed to initialize git integration", error=str(e))
+                logger.exception("Failed to initialize git integration", error=str(e))
 
         # Quick actions - conditionally enabled
         if self.config.enable_quick_actions:
@@ -60,28 +60,30 @@ class FeatureRegistry:
                 self.features["quick_actions"] = QuickActionManager()
                 logger.info("Quick actions feature enabled")
             except Exception as e:
-                logger.error("Failed to initialize quick actions", error=str(e))
+                logger.exception("Failed to initialize quick actions", error=str(e))
 
         # Session export - always enabled
         try:
             self.features["session_export"] = SessionExporter(storage=self.storage)
             logger.info("Session export feature enabled")
         except Exception as e:
-            logger.error("Failed to initialize session export", error=str(e))
+            logger.exception("Failed to initialize session export", error=str(e))
 
         # Image handling - always enabled
         try:
             self.features["image_handler"] = ImageHandler(config=self.config)
             logger.info("Image handler feature enabled")
         except Exception as e:
-            logger.error("Failed to initialize image handler", error=str(e))
+            logger.exception("Failed to initialize image handler", error=str(e))
 
         # Conversation enhancements - always enabled
         try:
             self.features["conversation"] = ConversationEnhancer()
             logger.info("Conversation enhancer feature enabled")
         except Exception as e:
-            logger.error("Failed to initialize conversation enhancer", error=str(e))
+            logger.exception(
+                "Failed to initialize conversation enhancer", error=str(e)
+            )
 
         logger.info(
             "Feature initialization complete",

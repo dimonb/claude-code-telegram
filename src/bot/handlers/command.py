@@ -261,7 +261,7 @@ async def continue_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     except Exception as e:
         error_msg = str(e)
-        logger.error("Error in continue command", error=error_msg, user_id=user_id)
+        logger.exception("Error in continue command", error=error_msg, user_id=user_id)
 
         # Delete status message if it exists
         try:
@@ -484,7 +484,9 @@ async def change_directory(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if audit_logger:
             await audit_logger.log_command(user_id, "cd", [target_path], False)
 
-        logger.error("Error in change_directory command", error=str(e), user_id=user_id)
+        logger.exception(
+            "Error in change_directory command", error=str(e), user_id=user_id
+        )
 
 
 async def print_working_directory(
@@ -574,7 +576,7 @@ async def show_projects(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     except Exception as e:
         await update.message.reply_text(f"❌ Error loading projects: {str(e)}")
-        logger.error("Error in show_projects command", error=str(e))
+        logger.exception("Error in show_projects command", error=str(e))
 
 
 async def session_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -827,7 +829,9 @@ async def quick_actions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     except Exception as e:
         await update.message.reply_text(f"❌ **Error Loading Actions**\n\n{str(e)}")
-        logger.error("Error in quick_actions command", error=str(e), user_id=user_id)
+        logger.exception(
+            "Error in quick_actions command", error=str(e), user_id=user_id
+        )
 
 
 async def git_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -918,7 +922,7 @@ async def git_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     except Exception as e:
         await update.message.reply_text(f"❌ **Git Error**\n\n{str(e)}")
-        logger.error("Error in git_command", error=str(e), user_id=user_id)
+        logger.exception("Error in git_command", error=str(e), user_id=user_id)
 
 
 def _format_file_size(size: int) -> str:

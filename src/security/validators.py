@@ -199,7 +199,7 @@ class SecurityValidator:
             return True, target, None
 
         except Exception as e:
-            logger.error("Path validation error", path=user_path, error=str(e))
+            logger.exception("Path validation error", path=user_path, error=str(e))
             return False, None, f"Invalid path: {str(e)}"
 
     def _is_within_directory(self, path: Path, directory: Path) -> bool:

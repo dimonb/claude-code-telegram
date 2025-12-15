@@ -143,7 +143,7 @@ class GitIntegration:
         except asyncio.TimeoutError:
             raise GitError("Git command timed out")
         except Exception as e:
-            logger.error(f"Git command error: {e}")
+            logger.exception("Git command error", error=str(e))
             raise GitError(f"Failed to execute git command: {e}")
 
     async def get_status(self, repo_path: Path) -> GitStatus:

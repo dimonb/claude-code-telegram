@@ -170,7 +170,7 @@ async def cost_tracking_middleware(
     except Exception as e:
         # Log error but don't update costs for failed operations
         processing_time = time.time() - start_time
-        logger.error(
+        logger.exception(
             "Handler execution failed",
             user_id=user_id,
             processing_time=processing_time,

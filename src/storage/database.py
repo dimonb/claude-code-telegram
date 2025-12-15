@@ -279,5 +279,5 @@ class DatabaseManager:
                 await conn.execute("SELECT 1")
                 return True
         except Exception as e:
-            logger.error("Database health check failed", error=str(e))
+            logger.exception("Database health check failed", error=str(e))
             return False

@@ -250,11 +250,10 @@ class AuthenticationManager:
                     )
                     return True
             except Exception as e:
-                logger.error(
+                logger.exception(
                     "Authentication provider error",
                     user_id=user_id,
                     provider=provider.__class__.__name__,
-                    error=str(e),
                 )
 
         logger.warning("Authentication failed for user", user_id=user_id)

@@ -162,10 +162,9 @@ class ClaudeProcessManager:
             )
 
         except Exception as e:
-            logger.error(
+            logger.exception(
                 "Claude Code process failed",
                 process_id=process_id,
-                error=str(e),
             )
             raise
 

@@ -224,16 +224,15 @@ class ClaudeSDKManager:
             )
 
         except asyncio.TimeoutError:
-            logger.error(
+            logger.exception(
                 "Claude SDK command timed out",
-                timeout_seconds=self.config.claude_timeout_seconds,
             )
             raise ClaudeTimeoutError(
                 f"Claude SDK timed out after {self.config.claude_timeout_seconds}s"
             )
 
         except CLINotFoundError as e:
-            logger.error("Claude CLI not found", error=str(e))
+            logger.exception("Claude CLI not found", error=str(e))
             error_msg = (
                 "Claude Code not found. Please ensure Claude is installed:\n"
                 "  npm install -g @anthropic-ai/claude-code\n\n"
@@ -245,28 +244,25 @@ class ClaudeSDKManager:
             raise ClaudeProcessError(error_msg)
 
         except ProcessError as e:
-            logger.error(
+            logger.exception(
                 "Claude process failed",
-                error=str(e),
                 exit_code=getattr(e, "exit_code", None),
             )
             raise ClaudeProcessError(f"Claude process error: {str(e)}")
 
         except CLIConnectionError as e:
-            logger.error("Claude connection error", error=str(e))
+            logger.exception("Claude connection error", error=str(e))
             raise ClaudeProcessError(f"Failed to connect to Claude: {str(e)}")
 
         except ClaudeSDKError as e:
-            logger.error("Claude SDK error", error=str(e))
+            logger.exception("Claude SDK error", error=str(e))
             raise ClaudeProcessError(f"Claude SDK error: {str(e)}")
 
         except Exception as e:
             # Handle ExceptionGroup from TaskGroup operations (Python 3.11+)
             if type(e).__name__ == "ExceptionGroup" or hasattr(e, "exceptions"):
-                logger.error(
+                logger.exception(
                     "Task group error in Claude SDK",
-                    error=str(e),
-                    error_type=type(e).__name__,
                     exception_count=len(getattr(e, "exceptions", [])),
                     exceptions=[
                         str(ex) for ex in getattr(e, "exceptions", [])[:3]
@@ -281,18 +277,14 @@ class ClaudeSDKManager:
 
             # Check if it's an ExceptionGroup disguised as a regular exception
             elif hasattr(e, "__notes__") and "TaskGroup" in str(e):
-                logger.error(
+                logger.exception(
                     "TaskGroup related error in Claude SDK",
-                    error=str(e),
-                    error_type=type(e).__name__,
                 )
                 raise ClaudeProcessError(f"Claude SDK task error: {str(e)}")
 
             else:
-                logger.error(
+                logger.exception(
                     "Unexpected error in Claude SDK",
-                    error=str(e),
-                    error_type=type(e).__name__,
                 )
                 raise ClaudeProcessError(f"Unexpected error: {str(e)}")
 
@@ -319,16 +311,12 @@ class ClaudeSDKManager:
         except Exception as e:
             # Handle both ExceptionGroups and regular exceptions
             if type(e).__name__ == "ExceptionGroup" or hasattr(e, "exceptions"):
-                logger.error(
+                logger.exception(
                     "TaskGroup error in streaming execution",
-                    error=str(e),
-                    error_type=type(e).__name__,
                 )
             else:
-                logger.error(
+                logger.exception(
                     "Error in streaming execution",
-                    error=str(e),
-                    error_type=type(e).__name__,
                 )
             # Re-raise to be handled by the outer try-catch
             raise

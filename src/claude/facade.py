@@ -216,9 +216,8 @@ class ClaudeIntegration:
             return response
 
         except Exception as e:
-            logger.error(
+            logger.exception(
                 "Claude command failed",
-                error=str(e),
                 user_id=user_id,
                 session_id=session.session_id,
             )

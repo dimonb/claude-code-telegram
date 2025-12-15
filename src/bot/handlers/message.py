@@ -246,7 +246,7 @@ async def handle_text_message(
 
             formatted_messages = [FormattedMessage(str(e), parse_mode="Markdown")]
         except Exception as e:
-            logger.error("Claude integration failed", error=str(e), user_id=user_id)
+            logger.exception("Claude integration failed", error=str(e), user_id=user_id)
             # Format error and create FormattedMessage
             from ..utils.formatting import FormattedMessage
 
@@ -360,7 +360,7 @@ async def handle_text_message(
                 success=False,
             )
 
-        logger.error("Error processing text message", error=str(e), user_id=user_id)
+        logger.exception("Error processing text message", error=str(e), user_id=user_id)
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -558,7 +558,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await claude_progress_msg.edit_text(
                 _format_error_message(str(e)), parse_mode="Markdown"
             )
-            logger.error("Claude file processing failed", error=str(e), user_id=user_id)
+            logger.exception(
+                "Claude file processing failed", error=str(e), user_id=user_id
+            )
 
         # Log successful file processing
         if audit_logger:
@@ -589,7 +591,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 file_size=document.file_size,
             )
 
-        logger.error("Error processing document", error=str(e), user_id=user_id)
+        logger.exception("Error processing document", error=str(e), user_id=user_id)
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -682,12 +684,12 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 await claude_progress_msg.edit_text(
                     _format_error_message(str(e)), parse_mode="Markdown"
                 )
-                logger.error(
+                logger.exception(
                     "Claude image processing failed", error=str(e), user_id=user_id
                 )
 
         except Exception as e:
-            logger.error("Image processing failed", error=str(e), user_id=user_id)
+            logger.exception("Image processing failed", error=str(e), user_id=user_id)
             await update.message.reply_text(
                 f"❌ **Error processing image**\n\n{str(e)}", parse_mode="Markdown"
             )
