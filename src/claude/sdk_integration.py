@@ -382,6 +382,29 @@ class ClaudeSDKManager:
             logger.exception("Claude SDK error", error=error_str)
             raise ClaudeProcessError(f"Claude SDK error: {error_str}")
 
+        except RuntimeError as e:
+            # Handle cancel scope errors gracefully
+            error_msg = str(e)
+            if "cancel scope" in error_msg.lower() or "different task" in error_msg.lower():
+                logger.warning(
+                    "Cancel scope error in Claude SDK (likely due to task cancellation)",
+                    error=error_msg,
+                )
+                # Check if we have messages with error info
+                for msg in messages:
+                    if isinstance(msg, ResultMessage) and getattr(msg, "is_error", False):
+                        result_error = getattr(msg, "result", "") or str(msg)
+                        raise ClaudeProcessError(f"Claude error: {result_error}") from None
+                # If no result message, suppress the cancel scope error
+                # It's likely a side effect of proper cancellation
+                raise ClaudeProcessError(
+                    "Claude SDK operation was cancelled"
+                ) from None
+            else:
+                # Re-raise other RuntimeErrors
+                logger.exception("RuntimeError in Claude SDK")
+                raise ClaudeProcessError(f"Claude SDK runtime error: {error_msg}")
+
         except Exception as e:
             # Handle ExceptionGroup from TaskGroup operations (Python 3.11+)
             if type(e).__name__ == "ExceptionGroup" or hasattr(e, "exceptions"):
@@ -442,9 +465,12 @@ class ClaudeSDKManager:
         text_blocks_count = 0
         assistant_messages_count = 0
 
+        # Store the async generator to properly close it on error
+        stream = None
         try:
             # Use claude_code_sdk.query directly to allow instrumentation patching
-            async for message in claude_code_sdk.query(prompt=prompt, options=options):
+            stream = claude_code_sdk.query(prompt=prompt, options=options)
+            async for message in stream:
                 messages.append(message)
                 message_count += 1
 
@@ -483,6 +509,32 @@ class ClaudeSDKManager:
                             error_type=type(callback_error).__name__,
                         )
 
+        except RuntimeError as e:
+            # Handle cancel scope errors gracefully
+            error_msg = str(e)
+            if "cancel scope" in error_msg.lower() or "different task" in error_msg.lower():
+                logger.warning(
+                    "Cancel scope error in streaming (likely due to task cancellation)",
+                    error=error_msg,
+                )
+                # Check if we have a ResultMessage with error before re-raising
+                for msg in messages:
+                    if isinstance(msg, ResultMessage) and getattr(msg, "is_error", False):
+                        result_error = getattr(msg, "result", "") or str(msg)
+                        logger.warning(
+                            "Found result message with error during cancel scope handling",
+                            error=result_error,
+                        )
+                        raise ClaudeProcessError(f"Claude error: {result_error}") from None
+                # If no result message, raise a cancellation error
+                # This will be caught and handled properly by execute_command
+                raise ClaudeProcessError(
+                    "Claude SDK operation was cancelled"
+                ) from None
+            else:
+                # Re-raise other RuntimeErrors
+                raise
+
         except Exception as e:
             # Check if we already have a ResultMessage with error before re-raising
             for msg in messages:
@@ -501,6 +553,18 @@ class ClaudeSDKManager:
             else:
                 logger.exception("Error in streaming execution")
             raise
+        finally:
+            # Properly close the async generator if it exists
+            if stream is not None:
+                try:
+                    await stream.aclose()
+                except Exception as close_error:
+                    # Ignore errors when closing - they're often cancel scope related
+                    if "cancel scope" not in str(close_error).lower():
+                        logger.debug(
+                            "Error closing stream generator",
+                            error=str(close_error),
+                        )
 
     async def _handle_stream_message(
         self, message: Message, stream_callback: Callable[[StreamUpdate], None]

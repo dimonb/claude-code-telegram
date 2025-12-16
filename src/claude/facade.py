@@ -284,6 +284,24 @@ class ClaudeIntegration:
                 self._sdk_failed_count = 0
                 return response
 
+            except RuntimeError as e:
+                # Handle cancel scope errors gracefully
+                error_str = str(e)
+                if "cancel scope" in error_str.lower() or "different task" in error_str.lower():
+                    logger.warning(
+                        "Cancel scope error in Claude SDK (likely due to task cancellation)",
+                        error=error_str,
+                    )
+                    # Check if this is a limit reached error wrapped in cancel scope error
+                    # In that case, we should still raise it as ClaudeProcessError
+                    from .exceptions import ClaudeProcessError
+                    raise ClaudeProcessError(
+                        "Claude SDK operation was cancelled"
+                    ) from None
+                else:
+                    # Re-raise other RuntimeErrors
+                    raise
+
             except Exception as e:
                 error_str = str(e)
 
@@ -302,6 +320,7 @@ class ClaudeIntegration:
                     or "JSON decode error" in error_str
                     or "TaskGroup" in error_str
                     or "ExceptionGroup" in error_str
+                    or ("cancel scope" in error_str.lower() and "different task" in error_str.lower())
                 ):
                     self._sdk_failed_count += 1
                     logger.warning(
