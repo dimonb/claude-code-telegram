@@ -235,10 +235,17 @@ async def handle_text_message(
             async def stream_handler(update_obj):
                 try:
                     # Check for usage limit in stream content
-                    if (
+                    # Handle both string and list content types
+                    content_str = (
                         update_obj.content
-                        and "limit reached" in update_obj.content.lower()
-                    ):
+                        if isinstance(update_obj.content, str)
+                        else (
+                            " ".join(update_obj.content)
+                            if isinstance(update_obj.content, list)
+                            else str(update_obj.content)
+                        )
+                    )
+                    if content_str and "limit reached" in content_str.lower():
                         import re
 
                         current_span = trace.get_current_span()

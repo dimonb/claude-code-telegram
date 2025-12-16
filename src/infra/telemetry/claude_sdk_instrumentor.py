@@ -93,40 +93,43 @@ class ClaudeSDKInstrumentor:
                 response_text_parts = []
 
                 try:
-                    # claude_code_sdk.query requires keyword-only arguments
-                    async for message in original_query(
-                        prompt=prompt, options=options, **kwargs
-                    ):
-                        message_count += 1
-                        yield message
+                    # Use sdk_span as the parent context for all child spans
+                    with trace.use_span(sdk_span):
+                        # claude_code_sdk.query requires keyword-only arguments
+                        async for message in original_query(
+                            prompt=prompt, options=options, **kwargs
+                        ):
+                            message_count += 1
+                            yield message
 
-                        # Track message types and extract data
-                        if isinstance(message, AssistantMessage):
-                            assistant_messages_count += 1
-                            content = getattr(message, "content", [])
-                            if content and isinstance(content, list):
-                                for block in content:
-                                    if isinstance(block, TextBlock):
-                                        text_blocks_count += 1
-                                        text = getattr(block, "text", "")
-                                        if text:
-                                            response_text_parts.append(text)
-                                    elif isinstance(block, ToolUseBlock):
-                                        tool_count += 1
-                                        tool_name = getattr(
-                                            block, "tool_name", "unknown"
-                                        )
-                                        # Record tool use as span event instead
-                                        # of nested span to avoid context issues
-                                        sdk_span.add_event(
-                                            f"tool.{tool_name}",
-                                            attributes={
-                                                "tool.name": tool_name,
-                                                "tool.input": str(
-                                                    getattr(block, "tool_input", {})
-                                                )[:500],
-                                            },
-                                        )
+                            # Track message types and extract data
+                            if isinstance(message, AssistantMessage):
+                                assistant_messages_count += 1
+                                content = getattr(message, "content", [])
+                                if content and isinstance(content, list):
+                                    for block in content:
+                                        if isinstance(block, TextBlock):
+                                            text_blocks_count += 1
+                                            text = getattr(block, "text", "")
+                                            if text:
+                                                response_text_parts.append(text)
+                                        elif isinstance(block, ToolUseBlock):
+                                            tool_count += 1
+                                            tool_name = getattr(
+                                                block, "tool_name", "unknown"
+                                            )
+                                            # Create a child span for each tool call
+                                            # This makes tool calls visible in traces
+                                            with tracer.start_as_current_span(
+                                                f"tool.{tool_name}"
+                                            ) as tool_span:
+                                                tool_span.set_attribute("tool.name", tool_name)
+                                                tool_input = getattr(block, "tool_input", {})
+                                                tool_span.set_attribute(
+                                                    "tool.input",
+                                                    str(tool_input)[:500],
+                                                )
+                                                # The span will be automatically ended when exiting the context
 
                         elif isinstance(message, ResultMessage):
                             cost = getattr(message, "total_cost_usd", None)
