@@ -131,13 +131,13 @@ class ClaudeSDKInstrumentor:
                                                 )
                                                 # The span will be automatically ended when exiting the context
 
-                        elif isinstance(message, ResultMessage):
-                            cost = getattr(message, "total_cost_usd", None)
-                            if cost is not None:
-                                total_cost = float(cost) or 0.0
-                                sdk_span.set_attribute(
-                                    "claude_code_sdk.cost_usd", total_cost
-                                )
+                            elif isinstance(message, ResultMessage):
+                                cost = getattr(message, "total_cost_usd", None)
+                                if cost is not None:
+                                    total_cost = float(cost) or 0.0
+                                    sdk_span.set_attribute(
+                                        "claude_code_sdk.cost_usd", total_cost
+                                    )
 
                     # Normal completion - set final attributes
                     sdk_span.set_attribute(
