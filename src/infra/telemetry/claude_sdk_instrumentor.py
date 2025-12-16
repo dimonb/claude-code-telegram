@@ -5,6 +5,7 @@ capture spans for all SDK calls, including tool usage, streaming messages,
 and error conditions.
 """
 
+import contextlib
 import functools
 import sys
 from typing import Any, AsyncIterator
@@ -54,140 +55,135 @@ class ClaudeSDKInstrumentor:
                 prompt: str, options: Any = None, **kwargs: Any
             ) -> AsyncIterator[Any]:
                 """Instrumented version of claude_code_sdk.query."""
-                # Always create a span for SDK queries
+                # Create span manually (not as context manager) to avoid
+                # context issues when generator is interrupted (GeneratorExit)
                 tracer = trace.get_tracer(__name__)
-                with tracer.start_as_current_span("claude_code_sdk.query") as sdk_span:
-                    sdk_span.set_attribute("claude_code_sdk.prompt_length", len(prompt))
-                    # Add prompt text (truncated if too long)
-                    prompt_text = prompt[:1000] + (
-                        "... (truncated)" if len(prompt) > 1000 else ""
+                sdk_span = tracer.start_span("claude_code_sdk.query")
+
+                sdk_span.set_attribute("claude_code_sdk.prompt_length", len(prompt))
+                # Add prompt text (truncated if too long)
+                prompt_text = prompt[:1000] + (
+                    "... (truncated)" if len(prompt) > 1000 else ""
+                )
+                sdk_span.set_attribute("claude_code_sdk.prompt", prompt_text)
+
+                if options:
+                    cwd = getattr(options, "cwd", None)
+                    if cwd:
+                        sdk_span.set_attribute("claude_code_sdk.cwd", str(cwd))
+                    max_turns = getattr(options, "max_turns", None)
+                    if max_turns:
+                        sdk_span.set_attribute("claude_code_sdk.max_turns", max_turns)
+                    allowed_tools = getattr(options, "allowed_tools", None)
+                    if allowed_tools:
+                        sdk_span.set_attribute(
+                            "claude_code_sdk.allowed_tools",
+                            (
+                                ",".join(allowed_tools)
+                                if isinstance(allowed_tools, list)
+                                else str(allowed_tools)
+                            ),
+                        )
+
+                message_count = 0
+                tool_count = 0
+                assistant_messages_count = 0
+                text_blocks_count = 0
+                total_cost = 0.0
+                response_text_parts = []
+
+                try:
+                    # claude_code_sdk.query requires keyword-only arguments
+                    async for message in original_query(
+                        prompt=prompt, options=options, **kwargs
+                    ):
+                        message_count += 1
+                        yield message
+
+                        # Track message types and extract data
+                        if isinstance(message, AssistantMessage):
+                            assistant_messages_count += 1
+                            content = getattr(message, "content", [])
+                            if content and isinstance(content, list):
+                                for block in content:
+                                    if isinstance(block, TextBlock):
+                                        text_blocks_count += 1
+                                        text = getattr(block, "text", "")
+                                        if text:
+                                            response_text_parts.append(text)
+                                    elif isinstance(block, ToolUseBlock):
+                                        tool_count += 1
+                                        tool_name = getattr(
+                                            block, "tool_name", "unknown"
+                                        )
+                                        # Record tool use as span event instead
+                                        # of nested span to avoid context issues
+                                        sdk_span.add_event(
+                                            f"tool.{tool_name}",
+                                            attributes={
+                                                "tool.name": tool_name,
+                                                "tool.input": str(
+                                                    getattr(block, "tool_input", {})
+                                                )[:500],
+                                            },
+                                        )
+
+                        elif isinstance(message, ResultMessage):
+                            cost = getattr(message, "total_cost_usd", None)
+                            if cost is not None:
+                                total_cost = float(cost) or 0.0
+                                sdk_span.set_attribute(
+                                    "claude_code_sdk.cost_usd", total_cost
+                                )
+
+                    # Normal completion - set final attributes
+                    sdk_span.set_attribute(
+                        "claude_code_sdk.message_count", message_count
                     )
-                    sdk_span.set_attribute("claude_code_sdk.prompt", prompt_text)
-
-                    if options:
-                        cwd = getattr(options, "cwd", None)
-                        if cwd:
-                            sdk_span.set_attribute("claude_code_sdk.cwd", str(cwd))
-                        max_turns = getattr(options, "max_turns", None)
-                        if max_turns:
-                            sdk_span.set_attribute(
-                                "claude_code_sdk.max_turns", max_turns
-                            )
-                        allowed_tools = getattr(options, "allowed_tools", None)
-                        if allowed_tools:
-                            sdk_span.set_attribute(
-                                "claude_code_sdk.allowed_tools",
-                                (
-                                    ",".join(allowed_tools)
-                                    if isinstance(allowed_tools, list)
-                                    else str(allowed_tools)
-                                ),
-                            )
-
-                    message_count = 0
-                    tool_count = 0
-                    assistant_messages_count = 0
-                    text_blocks_count = 0
-                    total_cost = 0.0
-                    response_text_parts = []  # Collect text from response
-
-                    try:
-                        # claude_code_sdk.query requires keyword-only arguments
-                        async for message in original_query(
-                            prompt=prompt, options=options, **kwargs
-                        ):
-                            message_count += 1
-                            yield message
-
-                            # Track message types and extract data
-                            if isinstance(message, AssistantMessage):
-                                assistant_messages_count += 1
-                                content = getattr(message, "content", [])
-                                if content and isinstance(content, list):
-                                    for block in content:
-                                        if isinstance(block, TextBlock):
-                                            text_blocks_count += 1
-                                            # Extract text from TextBlock
-                                            text = getattr(block, "text", "")
-                                            if text:
-                                                response_text_parts.append(text)
-                                        elif isinstance(block, ToolUseBlock):
-                                            tool_count += 1
-                                            tool_name = getattr(
-                                                block, "tool_name", "unknown"
-                                            )
-                                            # Create span for tool use
-                                            with tracer.start_as_current_span(
-                                                f"claude_code_sdk.tool.{tool_name}"
-                                            ) as tool_span:
-                                                tool_span.set_attribute(
-                                                    "claude_code_sdk.tool.name",
-                                                    tool_name,
-                                                )
-                                                tool_input = getattr(
-                                                    block, "tool_input", {}
-                                                )
-                                                if tool_input:
-                                                    tool_span.set_attribute(
-                                                        "claude_code_sdk.tool.input",
-                                                        str(tool_input)[:500],
-                                                    )
-                                                    if isinstance(tool_input, dict):
-                                                        tool_span.set_attribute(
-                                                            "claude_code_sdk.tool.input_keys",
-                                                            ",".join(tool_input.keys()),
-                                                        )
-
-                            elif isinstance(message, ResultMessage):
-                                # Extract cost from result message
-                                cost = getattr(message, "total_cost_usd", None)
-                                if cost is not None:
-                                    total_cost = float(cost) or 0.0
-                                    sdk_span.set_attribute(
-                                        "claude_code_sdk.cost_usd", total_cost
-                                    )
-
-                        # Set final attributes
-                        sdk_span.set_attribute(
-                            "claude_code_sdk.message_count", message_count
+                    sdk_span.set_attribute(
+                        "claude_code_sdk.assistant_messages_count",
+                        assistant_messages_count,
+                    )
+                    sdk_span.set_attribute("claude_code_sdk.tool_count", tool_count)
+                    sdk_span.set_attribute(
+                        "claude_code_sdk.text_blocks_count", text_blocks_count
+                    )
+                    if response_text_parts:
+                        response_text = "".join(response_text_parts)
+                        response_text_attr = (
+                            response_text[:1000] + "... (truncated)"
+                            if len(response_text) > 1000
+                            else response_text
                         )
                         sdk_span.set_attribute(
-                            "claude_code_sdk.assistant_messages_count",
-                            assistant_messages_count,
+                            "claude_code_sdk.response_text", response_text_attr
                         )
-                        sdk_span.set_attribute("claude_code_sdk.tool_count", tool_count)
+
+                except GeneratorExit:
+                    # Generator closed by consumer - mark as interrupted, not error
+                    sdk_span.set_attribute(
+                        "claude_code_sdk.generator_interrupted", True
+                    )
+                    sdk_span.set_attribute(
+                        "claude_code_sdk.message_count", message_count
+                    )
+                    raise
+
+                except Exception as e:
+                    sdk_span.record_exception(e)
+                    sdk_span.set_status(Status(StatusCode.ERROR, description=str(e)))
+                    error_str = str(e).lower()
+                    if "limit reached" in error_str or "usage limit" in error_str:
                         sdk_span.set_attribute(
-                            "claude_code_sdk.text_blocks_count", text_blocks_count
+                            "claude_code_sdk.error_type", "usage_limit_reached"
                         )
-                        if total_cost > 0:
-                            sdk_span.set_attribute(
-                                "claude_code_sdk.cost_usd", total_cost
-                            )
+                    raise
 
-                        # Add response text (combined from all TextBlocks)
-                        if response_text_parts:
-                            response_text = "".join(response_text_parts)
-                            response_text_attr = (
-                                response_text[:1000] + "... (truncated)"
-                                if len(response_text) > 1000
-                                else response_text
-                            )
-                            sdk_span.set_attribute(
-                                "claude_code_sdk.response_text", response_text_attr
-                            )
-
-                    except Exception as e:
-                        sdk_span.record_exception(e)
-                        sdk_span.set_status(
-                            Status(StatusCode.ERROR, description=str(e))
-                        )
-                        # Check for usage limit errors
-                        error_str = str(e).lower()
-                        if "limit reached" in error_str or "usage limit" in error_str:
-                            sdk_span.set_attribute(
-                                "claude_code_sdk.error_type", "usage_limit_reached"
-                            )
-                        raise
+                finally:
+                    # Always end the span, suppressing context detach errors
+                    # that can occur when generator is interrupted across tasks
+                    with contextlib.suppress(ValueError, RuntimeError):
+                        sdk_span.end()
 
             # Patch the module - this will affect future imports
             claude_code_sdk.query = instrumented_query
