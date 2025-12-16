@@ -193,14 +193,57 @@ class ClaudeSDKManager:
                 timeout=self.config.claude_timeout_seconds,
             )
 
-            # Extract cost and tools from result message
+            # Extract cost and tools from result message, check for errors
             cost = 0.0
             tools_used = []
+            result_error = None
             for message in messages:
                 if isinstance(message, ResultMessage):
                     cost = getattr(message, "total_cost_usd", 0.0) or 0.0
                     tools_used = self._extract_tools_from_messages(messages)
+                    # Check for error in result
+                    if getattr(message, "is_error", False):
+                        result_error = getattr(message, "result", "") or str(message)
                     break
+
+            # Handle result with error flag
+            if result_error:
+                error_lower = result_error.lower()
+                # Check for limit reached
+                if "limit reached" in error_lower:
+                    import re
+
+                    time_match = re.search(
+                        r"resets?\s*(?:at\s*)?(\d{1,2}(?::\d{2})?\s*[apm]{0,2})",
+                        result_error,
+                        re.IGNORECASE,
+                    )
+                    timezone_match = re.search(r"\(([^)]+)\)", result_error)
+                    reset_time = time_match.group(1) if time_match else "later"
+                    timezone = timezone_match.group(1) if timezone_match else ""
+
+                    logger.warning(
+                        "Claude usage limit reached",
+                        reset_time=reset_time,
+                        timezone=timezone,
+                    )
+
+                    user_friendly_msg = (
+                        f"⏱️ **Claude AI Usage Limit Reached**\n\n"
+                        f"You've reached your Claude AI usage limit for this period.\n\n"
+                        f"**When will it reset?**\n"
+                        f"Your limit will reset at **{reset_time}**"
+                        f"{f' ({timezone})' if timezone else ''}\n\n"
+                        f"**What you can do:**\n"
+                        f"• Wait for the limit to reset automatically\n"
+                        f"• Try again after the reset time\n"
+                        f"• Use simpler requests that require less processing\n"
+                        f"• Contact support if you need a higher limit"
+                    )
+                    raise ClaudeProcessError(user_friendly_msg)
+
+                # Other errors from result
+                raise ClaudeProcessError(f"Claude returned error: {result_error}")
 
             # Calculate duration
             duration_ms = int((asyncio.get_event_loop().time() - start_time) * 1000)
@@ -257,7 +300,9 @@ class ClaudeSDKManager:
                 import re
 
                 time_match = re.search(
-                    r"resets?\s*(\d+[apm]+)", error_str, re.IGNORECASE
+                    r"resets?\s*(?:at\s*)?(\d{1,2}(?::\d{2})?\s*[apm]{0,2})",
+                    error_str,
+                    re.IGNORECASE,
                 )
                 timezone_match = re.search(r"\(([^)]+)\)", error_str)
 
@@ -305,7 +350,9 @@ class ClaudeSDKManager:
                 import re
 
                 time_match = re.search(
-                    r"resets?\s*(\d+[apm]+)", error_str, re.IGNORECASE
+                    r"resets?\s*(?:at\s*)?(\d{1,2}(?::\d{2})?\s*[apm]{0,2})",
+                    error_str,
+                    re.IGNORECASE,
                 )
                 timezone_match = re.search(r"\(([^)]+)\)", error_str)
 
@@ -376,6 +423,10 @@ class ClaudeSDKManager:
                 )
                 raise ClaudeProcessError(f"Claude SDK task error: {str(e)}")
 
+            # If already a ClaudeProcessError, just re-raise without wrapping
+            elif isinstance(e, ClaudeProcessError):
+                raise
+
             else:
                 logger.exception(
                     "Unexpected error in Claude SDK",
@@ -396,6 +447,19 @@ class ClaudeSDKManager:
             async for message in claude_code_sdk.query(prompt=prompt, options=options):
                 messages.append(message)
                 message_count += 1
+
+                # Check for ResultMessage with error - handle immediately
+                if isinstance(message, ResultMessage):
+                    if getattr(message, "is_error", False):
+                        result_error = getattr(message, "result", "") or str(message)
+                        logger.warning(
+                            "Received result message with error",
+                            error=result_error,
+                            is_error=True,
+                        )
+                        # Store error info for later processing
+                        # Don't raise here - let the stream finish and handle in execute_command
+                        break  # Exit streaming loop since we got the final result
 
                 # Track message types
                 if isinstance(message, AssistantMessage):
@@ -420,6 +484,18 @@ class ClaudeSDKManager:
                         )
 
         except Exception as e:
+            # Check if we already have a ResultMessage with error before re-raising
+            for msg in messages:
+                if isinstance(msg, ResultMessage) and getattr(msg, "is_error", False):
+                    result_error = getattr(msg, "result", "") or str(msg)
+                    logger.warning(
+                        "Found result message with error during exception handling",
+                        error=result_error,
+                        original_exception=str(e),
+                    )
+                    # Re-raise with the actual error from result, not the SDK error
+                    raise ClaudeProcessError(f"Claude error: {result_error}") from e
+
             if type(e).__name__ == "ExceptionGroup" or hasattr(e, "exceptions"):
                 logger.exception("TaskGroup error in streaming execution")
             else:

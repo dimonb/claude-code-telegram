@@ -286,6 +286,16 @@ class ClaudeIntegration:
 
             except Exception as e:
                 error_str = str(e)
+
+                # Check if this is a known error that should NOT trigger fallback
+                # These are real errors, not SDK issues
+                if "limit reached" in error_str.lower():
+                    logger.info(
+                        "Claude limit reached, not using fallback",
+                        error=error_str,
+                    )
+                    raise
+
                 # Check if this is a JSON decode error that indicates SDK issues
                 if (
                     "Failed to decode JSON" in error_str
@@ -340,7 +350,7 @@ class ClaudeIntegration:
                         # For other fallback errors, prefer them if they're more specific
                         # JSON decode errors are usually symptoms, not root causes
                         if (
-                            "usage limit" in fallback_error_str.lower()
+                            "limit reached" in fallback_error_str.lower()
                             or "timeout" in fallback_error_str.lower()
                             or "process error" in fallback_error_str.lower()
                         ):

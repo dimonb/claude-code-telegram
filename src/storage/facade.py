@@ -3,7 +3,7 @@
 Provides simple API for the rest of the application.
 """
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any, Dict, Optional
 
 import structlog
@@ -94,7 +94,7 @@ class Storage:
             message_id=None,
             session_id=session_id,
             user_id=user_id,
-            timestamp=datetime.utcnow(),
+            timestamp=datetime.now(UTC),
             prompt=prompt,
             response=response.content,
             cost=response.cost,
@@ -113,7 +113,7 @@ class Storage:
                     message_id=message_id,
                     tool_name=tool["name"],
                     tool_input=tool.get("input", {}),
-                    timestamp=datetime.utcnow(),
+                    timestamp=datetime.now(UTC),
                     success=not response.is_error,
                     error_message=response.error_type if response.is_error else None,
                 )
@@ -127,7 +127,7 @@ class Storage:
         if user:
             user.total_cost += response.cost
             user.message_count += 1
-            user.last_active = datetime.utcnow()
+            user.last_active = datetime.now(UTC)
             await self.users.update_user(user)
 
         # Update session stats
@@ -136,7 +136,7 @@ class Storage:
             session.total_cost += response.cost
             session.total_turns += response.num_turns
             session.message_count += 1
-            session.last_used = datetime.utcnow()
+            session.last_used = datetime.now(UTC)
             await self.sessions.update_session(session)
 
         # Log audit event
@@ -153,7 +153,7 @@ class Storage:
                 "tools_used": [t["name"] for t in response.tools_used],
             },
             success=not response.is_error,
-            timestamp=datetime.utcnow(),
+            timestamp=datetime.now(UTC),
             ip_address=ip_address,
         )
         await self.audit.log_event(audit_event)
@@ -169,8 +169,8 @@ class Storage:
             user = UserModel(
                 user_id=user_id,
                 telegram_username=username,
-                first_seen=datetime.utcnow(),
-                last_active=datetime.utcnow(),
+                first_seen=datetime.now(UTC),
+                last_active=datetime.now(UTC),
                 is_allowed=False,  # Default to not allowed
             )
             await self.users.create_user(user)
@@ -185,8 +185,8 @@ class Storage:
             session_id=session_id,
             user_id=user_id,
             project_path=project_path,
-            created_at=datetime.utcnow(),
-            last_used=datetime.utcnow(),
+            created_at=datetime.now(UTC),
+            last_used=datetime.now(UTC),
         )
 
         await self.sessions.create_session(session)
@@ -214,7 +214,7 @@ class Storage:
             event_type=event_type,
             event_data=event_data,
             success=success,
-            timestamp=datetime.utcnow(),
+            timestamp=datetime.now(UTC),
             ip_address=ip_address,
         )
         await self.audit.log_event(audit_event)
@@ -233,7 +233,7 @@ class Storage:
             event_type=event_type,
             event_data=event_data,
             success=success,
-            timestamp=datetime.utcnow(),
+            timestamp=datetime.now(UTC),
         )
         await self.audit.log_event(audit_event)
 

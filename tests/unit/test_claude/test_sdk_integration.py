@@ -1,12 +1,13 @@
 """Test Claude SDK integration."""
 
+import asyncio
 import os
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from claude_code_sdk import ClaudeCodeOptions
 
+from src.claude.exceptions import ClaudeProcessError, ClaudeTimeoutError
 from src.claude.sdk_integration import ClaudeResponse, ClaudeSDKManager, StreamUpdate
 from src.config.settings import Settings
 
@@ -22,7 +23,7 @@ class TestClaudeSDKManager:
             telegram_bot_username="testbot",
             approved_directory=tmp_path,
             use_sdk=True,
-            claude_timeout_seconds=2,  # Short timeout for testing
+            claude_timeout_seconds=2,
         )
 
     @pytest.fixture
@@ -32,9 +33,6 @@ class TestClaudeSDKManager:
 
     async def test_sdk_manager_initialization_with_api_key(self, tmp_path):
         """Test SDK manager initialization with API key."""
-        from src.config.settings import Settings
-
-        # Test with API key provided
         config_with_key = Settings(
             telegram_bot_token="test:token",
             telegram_bot_username="testbot",
@@ -44,18 +42,13 @@ class TestClaudeSDKManager:
             claude_timeout_seconds=2,
         )
 
-        # Store original env var
         original_api_key = os.environ.get("ANTHROPIC_API_KEY")
 
         try:
             manager = ClaudeSDKManager(config_with_key)
-
-            # Check that API key was set in environment
             assert os.environ.get("ANTHROPIC_API_KEY") == "test-api-key"
             assert manager.active_sessions == {}
-
         finally:
-            # Restore original env var
             if original_api_key:
                 os.environ["ANTHROPIC_API_KEY"] = original_api_key
             elif "ANTHROPIC_API_KEY" in os.environ:
@@ -63,32 +56,25 @@ class TestClaudeSDKManager:
 
     async def test_sdk_manager_initialization_without_api_key(self, config):
         """Test SDK manager initialization without API key (uses CLI auth)."""
-        # Store original env var
         original_api_key = os.environ.get("ANTHROPIC_API_KEY")
 
         try:
-            # Remove any existing API key
             if "ANTHROPIC_API_KEY" in os.environ:
                 del os.environ["ANTHROPIC_API_KEY"]
 
             manager = ClaudeSDKManager(config)
-
-            # Check that no API key was set (should use CLI auth)
             assert config.anthropic_api_key_str is None
             assert manager.active_sessions == {}
-
         finally:
-            # Restore original env var
             if original_api_key:
                 os.environ["ANTHROPIC_API_KEY"] = original_api_key
 
     async def test_execute_command_success(self, sdk_manager):
         """Test successful command execution."""
-        from claude_code_sdk.types import AssistantMessage, ResultMessage
+        from claude_code_sdk.types import AssistantMessage, ResultMessage, TextBlock
 
-        # Mock the claude-code-sdk query function
         async def mock_query(prompt, options):
-            yield AssistantMessage(content="Test response")
+            yield AssistantMessage(content=[TextBlock(text="Test response")])
             yield ResultMessage(
                 subtype="success",
                 duration_ms=1000,
@@ -100,32 +86,30 @@ class TestClaudeSDKManager:
                 result="Success",
             )
 
-        with patch("src.claude.sdk_integration.query", side_effect=mock_query):
+        with patch("claude_code_sdk.query", side_effect=mock_query):
             response = await sdk_manager.execute_command(
                 prompt="Test prompt",
                 working_directory=Path("/test"),
                 session_id="test-session",
             )
 
-        # Verify response
         assert isinstance(response, ClaudeResponse)
         assert response.session_id == "test-session"
-        assert response.duration_ms >= 0  # Can be 0 in tests
+        assert response.duration_ms >= 0
         assert not response.is_error
         assert response.cost == 0.05
 
     async def test_execute_command_with_streaming(self, sdk_manager):
         """Test command execution with streaming callback."""
-        from claude_code_sdk.types import AssistantMessage, ResultMessage
+        from claude_code_sdk.types import AssistantMessage, ResultMessage, TextBlock
 
         stream_updates = []
 
         async def stream_callback(update: StreamUpdate):
             stream_updates.append(update)
 
-        # Mock the claude-code-sdk query function
         async def mock_query(prompt, options):
-            yield AssistantMessage(content="Test response")
+            yield AssistantMessage(content=[TextBlock(text="Test response")])
             yield ResultMessage(
                 subtype="success",
                 duration_ms=1000,
@@ -137,29 +121,24 @@ class TestClaudeSDKManager:
                 result="Success",
             )
 
-        with patch("src.claude.sdk_integration.query", side_effect=mock_query):
+        with patch("claude_code_sdk.query", side_effect=mock_query):
             response = await sdk_manager.execute_command(
                 prompt="Test prompt",
                 working_directory=Path("/test"),
                 stream_callback=stream_callback,
             )
 
-        # Verify streaming was called
         assert len(stream_updates) > 0
         assert any(update.type == "assistant" for update in stream_updates)
 
     async def test_execute_command_timeout(self, sdk_manager):
         """Test command execution timeout."""
-        import asyncio
 
-        # Mock a hanging operation - return async generator that never yields
         async def mock_hanging_query(prompt, options):
-            await asyncio.sleep(5)  # This should timeout (config has 2s timeout)
-            yield  # This will never be reached
+            await asyncio.sleep(5)
+            yield
 
-        from src.claude.exceptions import ClaudeTimeoutError
-
-        with patch("src.claude.sdk_integration.query", side_effect=mock_hanging_query):
+        with patch("claude_code_sdk.query", side_effect=mock_hanging_query):
             with pytest.raises(ClaudeTimeoutError):
                 await sdk_manager.execute_command(
                     prompt="Test prompt",
@@ -173,34 +152,395 @@ class TestClaudeSDKManager:
         session_id = "test-session"
         messages = [AssistantMessage(content="test")]
 
-        # Update session
         sdk_manager._update_session(session_id, messages)
 
-        # Verify session was created
         assert session_id in sdk_manager.active_sessions
         session_data = sdk_manager.active_sessions[session_id]
         assert session_data["messages"] == messages
 
     async def test_kill_all_processes(self, sdk_manager):
         """Test killing all processes (clearing sessions)."""
-        # Add some active sessions
         sdk_manager.active_sessions["session1"] = {"test": "data"}
         sdk_manager.active_sessions["session2"] = {"test": "data2"}
 
         assert len(sdk_manager.active_sessions) == 2
 
-        # Kill all processes
         await sdk_manager.kill_all_processes()
 
-        # Sessions should be cleared
         assert len(sdk_manager.active_sessions) == 0
 
     def test_get_active_process_count(self, sdk_manager):
         """Test getting active process count."""
         assert sdk_manager.get_active_process_count() == 0
 
-        # Add sessions
         sdk_manager.active_sessions["session1"] = {"test": "data"}
         sdk_manager.active_sessions["session2"] = {"test": "data2"}
 
         assert sdk_manager.get_active_process_count() == 2
+
+
+class TestClaudeSDKErrorHandling:
+    """Test error handling in Claude SDK integration."""
+
+    @pytest.fixture
+    def config(self, tmp_path):
+        """Create test config."""
+        return Settings(
+            telegram_bot_token="test:token",
+            telegram_bot_username="testbot",
+            approved_directory=tmp_path,
+            use_sdk=True,
+            claude_timeout_seconds=5,
+        )
+
+    @pytest.fixture
+    def sdk_manager(self, config):
+        """Create SDK manager."""
+        return ClaudeSDKManager(config)
+
+    async def test_limit_reached_error(self, sdk_manager):
+        """Test handling of usage limit reached error."""
+        from claude_code_sdk.types import AssistantMessage, ResultMessage, TextBlock
+
+        async def mock_query(prompt, options):
+            yield AssistantMessage(content=[TextBlock(text="Processing...")])
+            yield ResultMessage(
+                subtype="success",
+                duration_ms=1000,
+                duration_api_ms=0,
+                is_error=True,
+                num_turns=1,
+                session_id="test-session",
+                total_cost_usd=0,
+                result="Limit reached · resets 8pm (Asia/Jerusalem)",
+            )
+
+        with patch("claude_code_sdk.query", side_effect=mock_query):
+            with pytest.raises(ClaudeProcessError) as exc_info:
+                await sdk_manager.execute_command(
+                    prompt="Test prompt",
+                    working_directory=Path("/test"),
+                )
+
+        error_msg = str(exc_info.value)
+        assert "Usage Limit Reached" in error_msg
+        assert "8pm" in error_msg
+        assert "Asia/Jerusalem" in error_msg
+
+    async def test_limit_reached_error_without_timezone(self, sdk_manager):
+        """Test handling of limit reached error without timezone."""
+        from claude_code_sdk.types import ResultMessage
+
+        async def mock_query(prompt, options):
+            yield ResultMessage(
+                subtype="success",
+                duration_ms=1000,
+                duration_api_ms=0,
+                is_error=True,
+                num_turns=1,
+                session_id="test-session",
+                total_cost_usd=0,
+                result="Limit reached · resets 9am",
+            )
+
+        with patch("claude_code_sdk.query", side_effect=mock_query):
+            with pytest.raises(ClaudeProcessError) as exc_info:
+                await sdk_manager.execute_command(
+                    prompt="Test prompt",
+                    working_directory=Path("/test"),
+                )
+
+        error_msg = str(exc_info.value)
+        assert "Usage Limit Reached" in error_msg
+        assert "9am" in error_msg
+
+    async def test_generic_error_in_result(self, sdk_manager):
+        """Test handling of generic error in result message."""
+        from claude_code_sdk.types import ResultMessage
+
+        async def mock_query(prompt, options):
+            yield ResultMessage(
+                subtype="error",
+                duration_ms=500,
+                duration_api_ms=0,
+                is_error=True,
+                num_turns=1,
+                session_id="test-session",
+                total_cost_usd=0,
+                result="Some unexpected error occurred",
+            )
+
+        with patch("claude_code_sdk.query", side_effect=mock_query):
+            with pytest.raises(ClaudeProcessError) as exc_info:
+                await sdk_manager.execute_command(
+                    prompt="Test prompt",
+                    working_directory=Path("/test"),
+                )
+
+        error_msg = str(exc_info.value)
+        assert "Some unexpected error occurred" in error_msg
+
+    async def test_empty_error_in_result(self, sdk_manager):
+        """Test handling of empty error in result message."""
+        from claude_code_sdk.types import ResultMessage
+
+        async def mock_query(prompt, options):
+            yield ResultMessage(
+                subtype="error",
+                duration_ms=500,
+                duration_api_ms=0,
+                is_error=True,
+                num_turns=1,
+                session_id="test-session",
+                total_cost_usd=0,
+                result="",
+            )
+
+        with patch("claude_code_sdk.query", side_effect=mock_query):
+            with pytest.raises(ClaudeProcessError) as exc_info:
+                await sdk_manager.execute_command(
+                    prompt="Test prompt",
+                    working_directory=Path("/test"),
+                )
+
+        assert exc_info.value is not None
+
+    async def test_json_decode_error_with_result_error(self, sdk_manager):
+        """Test that result error takes precedence over JSON decode error."""
+        from claude_code_sdk.types import ResultMessage
+        from claude_code_sdk._errors import CLIJSONDecodeError
+
+        messages_received = []
+
+        async def mock_query(prompt, options):
+            msg = ResultMessage(
+                subtype="success",
+                duration_ms=1000,
+                duration_api_ms=0,
+                is_error=True,
+                num_turns=1,
+                session_id="test-session",
+                total_cost_usd=0,
+                result="Limit reached · resets 10pm",
+            )
+            messages_received.append(msg)
+            yield msg
+            raise CLIJSONDecodeError("invalid json", Exception("Extra data"))
+
+        with patch("claude_code_sdk.query", side_effect=mock_query):
+            with pytest.raises(ClaudeProcessError) as exc_info:
+                await sdk_manager.execute_command(
+                    prompt="Test prompt",
+                    working_directory=Path("/test"),
+                )
+
+        error_msg = str(exc_info.value)
+        assert "Limit reached" in error_msg or "Usage Limit" in error_msg
+
+    async def test_exception_group_with_result_error(self, sdk_manager):
+        """Test handling of ExceptionGroup when result has error."""
+        from claude_code_sdk.types import ResultMessage
+
+        async def mock_query(prompt, options):
+            yield ResultMessage(
+                subtype="success",
+                duration_ms=1000,
+                duration_api_ms=0,
+                is_error=True,
+                num_turns=1,
+                session_id="test-session",
+                total_cost_usd=0,
+                result="Limit reached · resets 11pm (UTC)",
+            )
+            raise ExceptionGroup("test errors", [ValueError("inner error")])
+
+        with patch("claude_code_sdk.query", side_effect=mock_query):
+            with pytest.raises(ClaudeProcessError) as exc_info:
+                await sdk_manager.execute_command(
+                    prompt="Test prompt",
+                    working_directory=Path("/test"),
+                )
+
+        error_msg = str(exc_info.value)
+        assert "Limit reached" in error_msg or "Usage Limit" in error_msg
+
+    async def test_claude_process_error_not_wrapped(self, sdk_manager):
+        """Test that ClaudeProcessError is not double-wrapped."""
+        original_error = ClaudeProcessError("Original error message")
+
+        async def mock_query(prompt, options):
+            raise original_error
+            yield
+
+        with patch("claude_code_sdk.query", side_effect=mock_query):
+            with pytest.raises(ClaudeProcessError) as exc_info:
+                await sdk_manager.execute_command(
+                    prompt="Test prompt",
+                    working_directory=Path("/test"),
+                )
+
+        assert "Original error message" in str(exc_info.value)
+        assert "Unexpected error:" not in str(exc_info.value)
+
+
+class TestClaudeIntegrationErrorHandling:
+    """Test error handling in Claude integration (subprocess)."""
+
+    @pytest.fixture
+    def config(self, tmp_path):
+        """Create test config."""
+        return Settings(
+            telegram_bot_token="test:token",
+            telegram_bot_username="testbot",
+            approved_directory=tmp_path,
+            use_sdk=False,
+            claude_timeout_seconds=5,
+        )
+
+    @pytest.fixture
+    def process_manager(self, config):
+        """Create process manager."""
+        from src.claude.integration import ClaudeProcessManager
+
+        return ClaudeProcessManager(config)
+
+    async def test_result_with_is_error_handled(self, process_manager):
+        """Test that result with is_error=True is properly handled."""
+        from unittest.mock import AsyncMock
+
+        mock_process = AsyncMock()
+        mock_process.wait = AsyncMock(return_value=0)
+        mock_process.stderr.read = AsyncMock(return_value=b"")
+
+        result_json = (
+            '{"type": "result", "is_error": true, '
+            '"result": "Limit reached · resets 5pm (UTC)", '
+            '"session_id": "test", "cost_usd": 0, "duration_ms": 100, "num_turns": 1}'
+        )
+
+        async def mock_read_stream(stream):
+            yield result_json
+
+        with (
+            patch.object(process_manager, "_start_process", return_value=mock_process),
+            patch.object(
+                process_manager, "_read_stream_bounded", side_effect=mock_read_stream
+            ),
+        ):
+            with pytest.raises(ClaudeProcessError) as exc_info:
+                await process_manager.execute_command(
+                    prompt="test",
+                    working_directory=Path("/test"),
+                )
+
+        error_msg = str(exc_info.value)
+        assert "Usage Limit Reached" in error_msg
+        assert "5pm" in error_msg
+
+    async def test_session_not_found_error(self, process_manager):
+        """Test handling of session not found error."""
+        from unittest.mock import AsyncMock
+
+        mock_process = AsyncMock()
+        mock_process.wait = AsyncMock(return_value=1)
+        mock_process.stderr.read = AsyncMock(
+            return_value=b"No conversation found with session ID: abc-123"
+        )
+
+        async def mock_read_stream(stream):
+            return
+            yield
+
+        with (
+            patch.object(process_manager, "_start_process", return_value=mock_process),
+            patch.object(
+                process_manager, "_read_stream_bounded", side_effect=mock_read_stream
+            ),
+        ):
+            with pytest.raises(ClaudeProcessError) as exc_info:
+                await process_manager.execute_command(
+                    prompt="test",
+                    working_directory=Path("/test"),
+                    session_id="abc-123",
+                    continue_session=True,
+                )
+
+        error_msg = str(exc_info.value)
+        assert "Session Not Found" in error_msg
+
+    async def test_empty_result_with_is_error_still_raises(self, process_manager):
+        """Test that empty result with is_error=True still raises error."""
+        from unittest.mock import AsyncMock
+
+        mock_process = AsyncMock()
+        mock_process.wait = AsyncMock(return_value=0)
+        mock_process.stderr.read = AsyncMock(return_value=b"")
+
+        result_json = (
+            '{"type": "result", "is_error": true, '
+            '"result": "", '
+            '"session_id": "test", "cost_usd": 0, "duration_ms": 100, "num_turns": 1}'
+        )
+
+        async def mock_read_stream(stream):
+            yield result_json
+
+        with (
+            patch.object(process_manager, "_start_process", return_value=mock_process),
+            patch.object(
+                process_manager, "_read_stream_bounded", side_effect=mock_read_stream
+            ),
+        ):
+            with pytest.raises(ClaudeProcessError) as exc_info:
+                await process_manager.execute_command(
+                    prompt="test",
+                    working_directory=Path("/test"),
+                )
+
+        assert exc_info.value is not None
+
+
+class TestMessageFormatting:
+    """Test error message formatting."""
+
+    def test_format_limit_reached_error(self):
+        """Test formatting of limit reached error message."""
+        from src.bot.handlers.message import _format_error_message
+
+        error = "Claude error: Limit reached · resets 8pm (Asia/Jerusalem)"
+        formatted = _format_error_message(error)
+
+        assert "Usage Limit Reached" in formatted
+        assert "8pm" in formatted
+        assert "Asia/Jerusalem" in formatted
+
+    def test_format_limit_reached_without_timezone(self):
+        """Test formatting of limit reached without timezone."""
+        from src.bot.handlers.message import _format_error_message
+
+        error = "Limit reached · resets 9am"
+        formatted = _format_error_message(error)
+
+        assert "Usage Limit Reached" in formatted
+        assert "9am" in formatted
+
+    def test_format_session_not_found_error(self):
+        """Test formatting of session not found error."""
+        from src.bot.handlers.message import _format_error_message
+
+        error = "No conversation found with session ID: test-123"
+        formatted = _format_error_message(error)
+
+        assert "Session Not Found" in formatted
+        assert "/new" in formatted
+
+    def test_already_formatted_message_not_changed(self):
+        """Test that already formatted messages are not changed."""
+        from src.bot.handlers.message import _format_error_message
+
+        formatted_msg = (
+            "⏱️ **Claude AI Usage Limit Reached**\n\n" "Already formatted message"
+        )
+        result = _format_error_message(formatted_msg)
+
+        assert result == formatted_msg

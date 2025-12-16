@@ -93,9 +93,35 @@ def _format_error_message(error_str: str) -> str:
         # Already formatted, return as-is
         return error_str
 
-    if "usage limit reached" in error_str.lower():
-        # Usage limit error - already user-friendly from integration.py
-        return error_str
+    # Check for limit reached (various formats)
+    if "limit reached" in error_str.lower():
+        # Usage limit error - already user-friendly if it starts with emoji
+        if error_str.startswith("⏱️"):
+            return error_str
+        # Otherwise format it
+        import re
+
+        time_match = re.search(
+            r"resets?\s*(?:at\s*)?(\d{1,2}(?::\d{2})?\s*[apm]{0,2})",
+            error_str,
+            re.IGNORECASE,
+        )
+        timezone_match = re.search(r"\(([^)]+)\)", error_str)
+        reset_time = time_match.group(1) if time_match else "later"
+        timezone = timezone_match.group(1) if timezone_match else ""
+
+        return (
+            f"⏱️ **Claude AI Usage Limit Reached**\n\n"
+            f"You've reached your Claude AI usage limit for this period.\n\n"
+            f"**When will it reset?**\n"
+            f"Your limit will reset at **{reset_time}**"
+            f"{f' ({timezone})' if timezone else ''}\n\n"
+            f"**What you can do:**\n"
+            f"• Wait for the limit to reset automatically\n"
+            f"• Try again after the reset time\n"
+            f"• Use simpler requests that require less processing\n"
+            f"• Contact support if you need a higher limit"
+        )
     elif "tool not allowed" in error_str.lower():
         # Tool validation error - already handled in facade.py
         return error_str
@@ -219,7 +245,9 @@ async def handle_text_message(
                         if current_span.is_recording():
                             content = update_obj.content
                             time_match = re.search(
-                                r"resets?\s*(\d+[apm]+)", content, re.IGNORECASE
+                                r"resets?\s*(?:at\s*)?(\d{1,2}(?::\d{2})?\s*[apm]{0,2})",
+                                content,
+                                re.IGNORECASE,
                             )
                             timezone_match = re.search(r"\(([^)]+)\)", content)
 

@@ -328,23 +328,48 @@ class ClaudeProcessManager:
             # Wait for process to complete
             return_code = await process.wait()
 
-            if return_code != 0:
+            # Check for error in result message first (errors come in JSON stream)
+            if result and result.get("is_error"):
+                error_msg = result.get("result", "")
+                logger.error(
+                    "Claude Code returned error in result",
+                    return_code=return_code,
+                    error_msg=error_msg,
+                    result=result,
+                )
+            elif return_code != 0:
                 stderr = await process.stderr.read()
                 error_msg = stderr.decode("utf-8", errors="replace")
+                # Also check if result has error info
+                if result and result.get("result"):
+                    error_msg = error_msg or result.get("result", "")
                 logger.error(
                     "Claude Code process failed",
                     return_code=return_code,
                     stderr=error_msg,
                 )
+            else:
+                error_msg = None
+
+            # Handle errors: check error_msg, return_code, or is_error flag
+            has_error = (
+                error_msg or return_code != 0 or (result and result.get("is_error"))
+            )
+            if has_error:
+                import re
+
+                error_msg_lower = (error_msg or "").lower()
 
                 # Check for specific error types
-                if "usage limit reached" in error_msg.lower():
-                    import re
-
+                # "Limit reached" or "usage limit reached"
+                if "limit reached" in error_msg_lower:
+                    # Try to extract reset time - patterns like "resets 8pm" or "reset at 8pm"
                     time_match = re.search(
-                        r"reset at (\d+[apm]+)", error_msg, re.IGNORECASE
+                        r"resets?\s*(?:at\s*)?(\d{1,2}(?::\d{2})?\s*[apm]{0,2})",
+                        error_msg or "",
+                        re.IGNORECASE,
                     )
-                    timezone_match = re.search(r"\(([^)]+)\)", error_msg)
+                    timezone_match = re.search(r"\(([^)]+)\)", error_msg or "")
 
                     reset_time = time_match.group(1) if time_match else "later"
                     timezone = timezone_match.group(1) if timezone_match else ""
@@ -374,9 +399,9 @@ class ClaudeProcessManager:
 
                 # Check for session/conversation not found errors
                 if (
-                    "no conversation found" in error_msg.lower()
-                    or "conversation not found" in error_msg.lower()
-                    or "session not found" in error_msg.lower()
+                    "no conversation found" in error_msg_lower
+                    or "conversation not found" in error_msg_lower
+                    or "session not found" in error_msg_lower
                 ):
                     span.set_attribute("claude.error_type", "session_not_found")
                     span.set_status(
@@ -384,10 +409,10 @@ class ClaudeProcessManager:
                     )
 
                     # Extract session ID if present
-                    import re
-
                     session_match = re.search(
-                        r"session\s+id[:\s]+([a-f0-9-]+)", error_msg, re.IGNORECASE
+                        r"session\s+id[:\s]+([a-f0-9-]+)",
+                        error_msg or "",
+                        re.IGNORECASE,
                     )
                     session_id_info = (
                         f" (session ID: {session_match.group(1)})"
@@ -413,7 +438,7 @@ class ClaudeProcessManager:
                     Status(StatusCode.ERROR, description=f"exit_code_{return_code}")
                 )
                 raise ClaudeProcessError(
-                    f"Claude Code exited with code {return_code}: {error_msg}"
+                    f"Claude Code exited with code {return_code}: {error_msg or 'Unknown error'}"
                 )
 
             if not result:
