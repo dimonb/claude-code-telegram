@@ -3,13 +3,14 @@
 Provides simple API for the rest of the application.
 """
 
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Any, Dict, Optional
 
 import structlog
 from opentelemetry import trace
 
 from ..claude.integration import ClaudeResponse
+from ..utils import utc_now
 from .database import DatabaseManager
 
 tracer = trace.get_tracer("storage.facade")
@@ -94,7 +95,7 @@ class Storage:
             message_id=None,
             session_id=session_id,
             user_id=user_id,
-            timestamp=datetime.now(UTC),
+            timestamp=utc_now(),
             prompt=prompt,
             response=response.content,
             cost=response.cost,
@@ -113,7 +114,7 @@ class Storage:
                     message_id=message_id,
                     tool_name=tool["name"],
                     tool_input=tool.get("input", {}),
-                    timestamp=datetime.now(UTC),
+                    timestamp=utc_now(),
                     success=not response.is_error,
                     error_message=response.error_type if response.is_error else None,
                 )
@@ -127,7 +128,7 @@ class Storage:
         if user:
             user.total_cost += response.cost
             user.message_count += 1
-            user.last_active = datetime.now(UTC)
+            user.last_active = utc_now()
             await self.users.update_user(user)
 
         # Update session stats
@@ -136,7 +137,7 @@ class Storage:
             session.total_cost += response.cost
             session.total_turns += response.num_turns
             session.message_count += 1
-            session.last_used = datetime.now(UTC)
+            session.last_used = utc_now()
             await self.sessions.update_session(session)
 
         # Log audit event
@@ -153,7 +154,7 @@ class Storage:
                 "tools_used": [t["name"] for t in response.tools_used],
             },
             success=not response.is_error,
-            timestamp=datetime.now(UTC),
+            timestamp=utc_now(),
             ip_address=ip_address,
         )
         await self.audit.log_event(audit_event)
@@ -169,8 +170,8 @@ class Storage:
             user = UserModel(
                 user_id=user_id,
                 telegram_username=username,
-                first_seen=datetime.now(UTC),
-                last_active=datetime.now(UTC),
+                first_seen=utc_now(),
+                last_active=utc_now(),
                 is_allowed=False,  # Default to not allowed
             )
             await self.users.create_user(user)
@@ -185,8 +186,8 @@ class Storage:
             session_id=session_id,
             user_id=user_id,
             project_path=project_path,
-            created_at=datetime.now(UTC),
-            last_used=datetime.now(UTC),
+            created_at=utc_now(),
+            last_used=utc_now(),
         )
 
         await self.sessions.create_session(session)
@@ -214,7 +215,7 @@ class Storage:
             event_type=event_type,
             event_data=event_data,
             success=success,
-            timestamp=datetime.now(UTC),
+            timestamp=utc_now(),
             ip_address=ip_address,
         )
         await self.audit.log_event(audit_event)
@@ -233,7 +234,7 @@ class Storage:
             event_type=event_type,
             event_data=event_data,
             success=success,
-            timestamp=datetime.now(UTC),
+            timestamp=utc_now(),
         )
         await self.audit.log_event(audit_event)
 

@@ -3,13 +3,14 @@
 Replaces the in-memory session storage with SQLite persistence.
 """
 
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
 import structlog
 
 from ..claude.session import ClaudeSession, SessionStorage
+from ..utils import utc_now
 from .database import DatabaseManager
 from .models import SessionModel, UserModel
 
@@ -36,7 +37,7 @@ class SQLiteSessionStorage(SessionStorage):
 
             if not user_exists:
                 # Create user record
-                now = datetime.now(UTC)
+                now = utc_now()
                 await conn.execute(
                     """
                     INSERT INTO users (user_id, telegram_username, first_seen, last_active, is_allowed)

@@ -7,11 +7,12 @@ Features:
 """
 
 import json
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Dict, List, Optional
 
 import structlog
 
+from ..utils import utc_now
 from .database import DatabaseManager
 from .models import (
     AuditLogModel,
@@ -52,8 +53,8 @@ class UserRepository:
                 (
                     user.user_id,
                     user.telegram_username,
-                    user.first_seen or datetime.now(UTC),
-                    user.last_active or datetime.now(UTC),
+                    user.first_seen or utc_now(),
+                    user.last_active or utc_now(),
                     user.is_allowed,
                 ),
             )
@@ -76,7 +77,7 @@ class UserRepository:
             """,
                 (
                     user.telegram_username,
-                    user.last_active or datetime.now(UTC),
+                    user.last_active or utc_now(),
                     user.total_cost,
                     user.message_count,
                     user.session_count,
@@ -460,7 +461,7 @@ class CostTrackingRepository:
     async def update_daily_cost(self, user_id: int, cost: float, date: str = None):
         """Update daily cost for user."""
         if not date:
-            date = datetime.now(UTC).strftime("%Y-%m-%d")
+            date = utc_now().strftime("%Y-%m-%d")
 
         async with self.db.get_connection() as conn:
             await conn.execute(

@@ -1,9 +1,10 @@
 """Telegram bot authentication middleware."""
 
-from datetime import UTC, datetime
 from typing import Any, Callable, Dict
 
 import structlog
+
+from src.utils import utc_now
 
 logger = structlog.get_logger()
 
@@ -86,7 +87,7 @@ async def auth_middleware(handler: Callable, event: Any, data: Dict[str, Any]) -
         if event.effective_message:
             await event.effective_message.reply_text(
                 f"🔓 Welcome! You are now authenticated.\n"
-                f"Session started at {datetime.now(UTC).strftime('%H:%M:%S UTC')}"
+                f"Session started at {utc_now().strftime('%H:%M:%S UTC')}"
             )
 
         # Continue to handler

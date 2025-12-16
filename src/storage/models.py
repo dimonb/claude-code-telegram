@@ -5,10 +5,13 @@ Using dataclasses for simplicity and type safety.
 
 import json
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
 
 import aiosqlite
+
+from ..utils import is_expired as check_expired
+from ..utils import is_past
 
 
 @dataclass
@@ -83,11 +86,7 @@ class SessionModel:
 
     def is_expired(self, timeout_hours: int) -> bool:
         """Check if session has expired."""
-        if not self.last_used:
-            return True
-
-        age = datetime.now(UTC) - self.last_used
-        return age.total_seconds() > (timeout_hours * 3600)
+        return check_expired(self.last_used, timedelta(hours=timeout_hours))
 
 
 @dataclass
@@ -264,6 +263,4 @@ class UserTokenModel:
 
     def is_expired(self) -> bool:
         """Check if token has expired."""
-        if not self.expires_at:
-            return False
-        return datetime.now(UTC) > self.expires_at
+        return is_past(self.expires_at)

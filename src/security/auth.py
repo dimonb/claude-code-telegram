@@ -11,13 +11,15 @@ import hashlib
 import secrets
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 import structlog
 from opentelemetry import trace
 
 from src.exceptions import SecurityError
+from src.utils import is_expired as check_expired
+from src.utils import is_past, utc_now
 
 # from src.exceptions import AuthenticationError  # Future use
 
@@ -42,11 +44,11 @@ class UserSession:
 
     def is_expired(self) -> bool:
         """Check if session has expired."""
-        return datetime.now(UTC) - self.last_activity > self.session_timeout
+        return check_expired(self.last_activity, self.session_timeout)
 
     def refresh(self) -> None:
         """Refresh session activity."""
-        self.last_activity = datetime.now(UTC)
+        self.last_activity = utc_now()
 
 
 class AuthProvider(ABC):
@@ -128,15 +130,15 @@ class InMemoryTokenStorage(TokenStorage):
         self._tokens[user_id] = {
             "hash": token_hash,
             "expires_at": expires_at,
-            "created_at": datetime.now(UTC),
+            "created_at": utc_now(),
         }
 
     async def get_user_token(self, user_id: int) -> Optional[Dict[str, Any]]:
         """Get token data from memory."""
         token_data = self._tokens.get(user_id)
-        if token_data and token_data["expires_at"] > datetime.now(UTC):
-            return token_data
-        elif token_data:
+        if token_data:
+            if not is_past(token_data["expires_at"]):
+                return token_data
             # Token expired, remove it
             del self._tokens[user_id]
         return None
@@ -184,7 +186,7 @@ class TokenAuthProvider(AuthProvider):
         """Generate new authentication token."""
         token = secrets.token_urlsafe(32)
         hashed = self._hash_token(token)
-        expires_at = datetime.now(UTC) + self.token_lifetime
+        expires_at = utc_now() + self.token_lifetime
 
         await self.storage.store_token(user_id, hashed, expires_at)
 
@@ -284,8 +286,8 @@ class AuthenticationManager:
         self.sessions[user_id] = UserSession(
             user_id=user_id,
             auth_provider=provider.__class__.__name__,
-            created_at=datetime.now(UTC),
-            last_activity=datetime.now(UTC),
+            created_at=utc_now(),
+            last_activity=utc_now(),
             user_info=user_info,
         )
 

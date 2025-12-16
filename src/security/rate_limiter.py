@@ -10,13 +10,14 @@ Features:
 import asyncio
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from typing import Any, Dict, Optional, Tuple
 
 import structlog
 from opentelemetry import trace
 
 from ..config.settings import Settings
+from ..utils import time_since, utc_now
 
 logger = structlog.get_logger()
 tracer = trace.get_tracer("security.rate_limiter")
@@ -41,10 +42,13 @@ class RateLimitBucket:
 
     def _refill(self) -> None:
         """Refill tokens based on time passed."""
-        now = datetime.now(UTC)
-        elapsed = (now - self.last_update).total_seconds()
-        self.tokens = min(self.capacity, self.tokens + (elapsed * self.refill_rate))
-        self.last_update = now
+        elapsed = time_since(self.last_update)
+        if elapsed:
+            self.tokens = min(
+                self.capacity,
+                self.tokens + (elapsed.total_seconds() * self.refill_rate),
+            )
+        self.last_update = utc_now()
 
     def get_wait_time(self, tokens: int = 1) -> float:
         """Get time to wait before tokens are available."""
@@ -199,7 +203,7 @@ class RateLimiter:
             self.request_buckets[user_id] = RateLimitBucket(
                 capacity=self.config.rate_limit_burst,
                 tokens=self.config.rate_limit_burst,
-                last_update=datetime.now(UTC),
+                last_update=utc_now(),
                 refill_rate=self.refill_rate,
             )
             logger.debug("Created rate limit bucket", user_id=user_id)
@@ -208,7 +212,7 @@ class RateLimiter:
 
     def _maybe_reset_cost_tracker(self, user_id: int) -> None:
         """Reset cost tracker if reset period has passed."""
-        now = datetime.now(UTC)
+        now = utc_now()
         last_reset = self.cost_reset_time.get(user_id, now - timedelta(days=1))
 
         # Reset daily (configurable)
@@ -232,14 +236,14 @@ class RateLimiter:
             # Reset cost tracking
             old_cost = self.cost_tracker[user_id]
             self.cost_tracker[user_id] = 0
-            self.cost_reset_time[user_id] = datetime.now(UTC)
+            self.cost_reset_time[user_id] = utc_now()
 
             # Reset request bucket
             if user_id in self.request_buckets:
                 self.request_buckets[user_id].tokens = self.request_buckets[
                     user_id
                 ].capacity
-                self.request_buckets[user_id].last_update = datetime.now(UTC)
+                self.request_buckets[user_id].last_update = utc_now()
 
             logger.info("User limits reset", user_id=user_id, old_cost=old_cost)
 
@@ -262,9 +266,7 @@ class RateLimiter:
                 "remaining": cost_remaining,
                 "utilization": current_cost / self.config.claude_max_cost_per_user,
             },
-            "last_reset": self.cost_reset_time.get(
-                user_id, datetime.now(UTC)
-            ).isoformat(),
+            "last_reset": self.cost_reset_time.get(user_id, utc_now()).isoformat(),
         }
 
     def get_global_status(self) -> Dict[str, Any]:
@@ -285,7 +287,7 @@ class RateLimiter:
         self, inactive_threshold: timedelta = timedelta(hours=24)
     ) -> int:
         """Clean up rate limit data for inactive users."""
-        now = datetime.now(UTC)
+        now = utc_now()
         inactive_users = []
 
         # Find users with old buckets

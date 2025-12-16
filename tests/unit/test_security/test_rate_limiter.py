@@ -1,11 +1,12 @@
 """Tests for rate limiting system."""
 
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 
 import pytest
 
 from src.config import create_test_config
 from src.security.rate_limiter import RateLimitBucket, RateLimiter
+from src.utils import utc_now
 
 
 class TestRateLimitBucket:
@@ -14,7 +15,7 @@ class TestRateLimitBucket:
     def test_bucket_creation(self):
         """Test bucket creation with initial tokens."""
         bucket = RateLimitBucket(
-            capacity=10, tokens=10, last_update=datetime.now(UTC), refill_rate=1.0
+            capacity=10, tokens=10, last_update=utc_now(), refill_rate=1.0
         )
 
         assert bucket.capacity == 10
@@ -24,7 +25,7 @@ class TestRateLimitBucket:
     def test_token_consumption(self):
         """Test consuming tokens from bucket."""
         bucket = RateLimitBucket(
-            capacity=10, tokens=5, last_update=datetime.now(UTC), refill_rate=1.0
+            capacity=10, tokens=5, last_update=utc_now(), refill_rate=1.0
         )
 
         # Should be able to consume available tokens
@@ -37,7 +38,7 @@ class TestRateLimitBucket:
 
     def test_token_refill(self):
         """Test token refill over time."""
-        past_time = datetime.now(UTC) - timedelta(seconds=5)
+        past_time = utc_now() - timedelta(seconds=5)
         bucket = RateLimitBucket(
             capacity=10,
             tokens=5,
@@ -55,7 +56,7 @@ class TestRateLimitBucket:
     def test_wait_time_calculation(self):
         """Test wait time calculation when tokens not available."""
         bucket = RateLimitBucket(
-            capacity=10, tokens=2, last_update=datetime.now(UTC), refill_rate=1.0
+            capacity=10, tokens=2, last_update=utc_now(), refill_rate=1.0
         )
 
         # Should be able to consume available tokens immediately
@@ -69,7 +70,7 @@ class TestRateLimitBucket:
     def test_bucket_status(self):
         """Test bucket status reporting."""
         bucket = RateLimitBucket(
-            capacity=10, tokens=7, last_update=datetime.now(UTC), refill_rate=2.0
+            capacity=10, tokens=7, last_update=utc_now(), refill_rate=2.0
         )
 
         status = bucket.get_status()
@@ -141,7 +142,7 @@ class TestRateLimiter:
 
         # Set cost near limit and set reset time to prevent auto-reset
         rate_limiter.cost_tracker[user_id] = 4.8
-        rate_limiter.cost_reset_time[user_id] = datetime.now(UTC)  # Prevent reset
+        rate_limiter.cost_reset_time[user_id] = utc_now()  # Prevent reset
 
         # Request that would exceed limit
         allowed, message = await rate_limiter.check_rate_limit(user_id, cost=0.5)
@@ -187,7 +188,7 @@ class TestRateLimiter:
         user_id = 123
 
         # Set old reset time
-        old_time = datetime.now(UTC) - timedelta(days=2)
+        old_time = utc_now() - timedelta(days=2)
         rate_limiter.cost_reset_time[user_id] = old_time
         rate_limiter.cost_tracker[user_id] = 3.0
 
@@ -235,7 +236,7 @@ class TestRateLimiter:
 
         # Create old bucket
         bucket = rate_limiter._get_or_create_bucket(user_id)
-        bucket.last_update = datetime.now(UTC) - timedelta(hours=25)
+        bucket.last_update = utc_now() - timedelta(hours=25)
         rate_limiter.cost_tracker[user_id] = 1.0
 
         # Cleanup
