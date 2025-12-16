@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional
 
 import structlog
 
-from src.utils import utc_now
+from src.utils import ensure_utc, utc_now
 
 # from src.exceptions import SecurityError  # Future use
 
@@ -114,13 +114,19 @@ class InMemoryAuditStorage(AuditStorage):
             filtered_events = [e for e in filtered_events if e.event_type == event_type]
 
         if start_time is not None:
-            filtered_events = [e for e in filtered_events if e.timestamp >= start_time]
+            start_time_utc = ensure_utc(start_time)
+            filtered_events = [
+                e for e in filtered_events if ensure_utc(e.timestamp) >= start_time_utc
+            ]
 
         if end_time is not None:
-            filtered_events = [e for e in filtered_events if e.timestamp <= end_time]
+            end_time_utc = ensure_utc(end_time)
+            filtered_events = [
+                e for e in filtered_events if ensure_utc(e.timestamp) <= end_time_utc
+            ]
 
         # Sort by timestamp (newest first) and limit
-        filtered_events.sort(key=lambda e: e.timestamp, reverse=True)
+        filtered_events.sort(key=lambda e: ensure_utc(e.timestamp), reverse=True)
         return filtered_events[:limit]
 
     async def get_security_violations(

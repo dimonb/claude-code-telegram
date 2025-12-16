@@ -17,8 +17,7 @@ import structlog
 from opentelemetry import trace
 
 from ..config.settings import Settings
-from ..utils import is_expired as check_expired
-from ..utils import utc_now
+from ..utils import ensure_utc, is_expired as check_expired, utc_now
 
 tracer = trace.get_tracer("claude.session")
 
@@ -208,8 +207,8 @@ class SessionManager:
         # Check user session limit
         user_sessions = await self._get_user_sessions(user_id)
         if len(user_sessions) >= self.config.max_sessions_per_user:
-            # Remove oldest session
-            oldest = min(user_sessions, key=lambda s: s.last_used)
+            # Remove oldest session (use ensure_utc for comparison of mixed naive/aware)
+            oldest = min(user_sessions, key=lambda s: ensure_utc(s.last_used))
             await self.remove_session(oldest.session_id)
             logger.info(
                 "Removed oldest session due to limit",

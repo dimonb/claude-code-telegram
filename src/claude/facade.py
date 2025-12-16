@@ -11,6 +11,7 @@ from opentelemetry import trace
 from opentelemetry.trace import Status, StatusCode
 
 from ..config.settings import Settings
+from ..utils import ensure_utc
 from .exceptions import ClaudeToolValidationError
 from .integration import ClaudeProcessManager, ClaudeResponse, StreamUpdate
 from .monitor import ToolMonitor
@@ -287,7 +288,10 @@ class ClaudeIntegration:
             except RuntimeError as e:
                 # Handle cancel scope errors gracefully
                 error_str = str(e)
-                if "cancel scope" in error_str.lower() or "different task" in error_str.lower():
+                if (
+                    "cancel scope" in error_str.lower()
+                    or "different task" in error_str.lower()
+                ):
                     logger.warning(
                         "Cancel scope error in Claude SDK (likely due to task cancellation)",
                         error=error_str,
@@ -295,6 +299,7 @@ class ClaudeIntegration:
                     # Check if this is a limit reached error wrapped in cancel scope error
                     # In that case, we should still raise it as ClaudeProcessError
                     from .exceptions import ClaudeProcessError
+
                     raise ClaudeProcessError(
                         "Claude SDK operation was cancelled"
                     ) from None
@@ -320,7 +325,10 @@ class ClaudeIntegration:
                     or "JSON decode error" in error_str
                     or "TaskGroup" in error_str
                     or "ExceptionGroup" in error_str
-                    or ("cancel scope" in error_str.lower() and "different task" in error_str.lower())
+                    or (
+                        "cancel scope" in error_str.lower()
+                        and "different task" in error_str.lower()
+                    )
                 ):
                     self._sdk_failed_count += 1
                     logger.warning(
@@ -433,8 +441,8 @@ class ClaudeIntegration:
             logger.info("No matching sessions found", user_id=user_id)
             return None
 
-        # Get most recent
-        latest_session = max(matching_sessions, key=lambda s: s.last_used)
+        # Get most recent (use ensure_utc for comparison of mixed naive/aware)
+        latest_session = max(matching_sessions, key=lambda s: ensure_utc(s.last_used))
 
         # Continue session
         return await self.run_command(
