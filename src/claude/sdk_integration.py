@@ -348,9 +348,26 @@ class ClaudeSDKManager:
                 # Extract the most relevant exception from the group
                 exceptions = getattr(e, "exceptions", [e])
                 main_exception = exceptions[0] if exceptions else e
-                raise ClaudeProcessError(
-                    f"Claude SDK task error: {str(main_exception)}"
-                )
+                error_str = str(main_exception)
+
+                # Check if JSON decode error contains session-related information
+                if (
+                    "Failed to decode JSON" in error_str
+                    or "JSONDecodeError" in error_str
+                ):
+                    # JSON decode errors are often symptoms of underlying issues
+                    # Try to extract more context from the error message
+                    if (
+                        "session" in error_str.lower()
+                        or "conversation" in error_str.lower()
+                    ):
+                        # If session info is in the error, preserve it
+                        raise ClaudeProcessError(f"Claude SDK error: {error_str}")
+                    else:
+                        # Generic JSON decode error - will trigger fallback
+                        raise ClaudeProcessError(f"Claude SDK task error: {error_str}")
+                else:
+                    raise ClaudeProcessError(f"Claude SDK task error: {error_str}")
 
             # Check if it's an ExceptionGroup disguised as a regular exception
             elif hasattr(e, "__notes__") and "TaskGroup" in str(e):

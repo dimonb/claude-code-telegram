@@ -315,13 +315,48 @@ class ClaudeIntegration:
                         return response
 
                     except Exception as fallback_error:
+                        fallback_error_str = str(fallback_error)
                         logger.error(
                             "Both SDK and subprocess failed",
                             sdk_error=error_str,
-                            subprocess_error=str(fallback_error),
+                            subprocess_error=fallback_error_str,
                         )
-                        # Re-raise the original SDK error since it was the primary method
-                        raise e
+
+                        # Prioritize more informative errors from fallback
+                        # Session errors are more actionable than JSON decode errors
+                        if (
+                            "no conversation found" in fallback_error_str.lower()
+                            or "conversation not found" in fallback_error_str.lower()
+                            or "session not found" in fallback_error_str.lower()
+                            or "session could not be found"
+                            in fallback_error_str.lower()
+                        ):
+                            logger.info(
+                                "Prioritizing fallback error over SDK JSON decode error",
+                                fallback_error=fallback_error_str,
+                            )
+                            raise fallback_error
+
+                        # For other fallback errors, prefer them if they're more specific
+                        # JSON decode errors are usually symptoms, not root causes
+                        if (
+                            "usage limit" in fallback_error_str.lower()
+                            or "timeout" in fallback_error_str.lower()
+                            or "process error" in fallback_error_str.lower()
+                        ):
+                            logger.info(
+                                "Prioritizing fallback error over SDK JSON decode error",
+                                fallback_error=fallback_error_str,
+                            )
+                            raise fallback_error
+
+                        # Otherwise, raise the fallback error with context about SDK failure
+                        from .exceptions import ClaudeProcessError
+
+                        raise ClaudeProcessError(
+                            f"Claude execution failed: {fallback_error_str} "
+                            f"(SDK also failed with JSON decode error)"
+                        ) from fallback_error
                 else:
                     # For non-JSON errors, re-raise immediately
                     logger.error(

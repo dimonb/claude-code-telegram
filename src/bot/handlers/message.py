@@ -88,13 +88,22 @@ async def _format_progress_update(update_obj) -> Optional[str]:
 
 def _format_error_message(error_str: str) -> str:
     """Format error messages for user-friendly display."""
+    # Check if message is already formatted (contains emoji and markdown)
+    if error_str.startswith(("🔄", "⏱️", "⏰", "🚫", "❌")) and "**" in error_str:
+        # Already formatted, return as-is
+        return error_str
+
     if "usage limit reached" in error_str.lower():
         # Usage limit error - already user-friendly from integration.py
         return error_str
     elif "tool not allowed" in error_str.lower():
         # Tool validation error - already handled in facade.py
         return error_str
-    elif "no conversation found" in error_str.lower():
+    elif (
+        "no conversation found" in error_str.lower()
+        or "session not found" in error_str.lower()
+        or "conversation not found" in error_str.lower()
+    ):
         return (
             f"🔄 **Session Not Found**\n\n"
             f"The Claude session could not be found or has expired.\n\n"

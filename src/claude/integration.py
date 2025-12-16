@@ -372,6 +372,40 @@ class ClaudeProcessManager:
 
                     raise ClaudeProcessError(user_friendly_msg)
 
+                # Check for session/conversation not found errors
+                if (
+                    "no conversation found" in error_msg.lower()
+                    or "conversation not found" in error_msg.lower()
+                    or "session not found" in error_msg.lower()
+                ):
+                    span.set_attribute("claude.error_type", "session_not_found")
+                    span.set_status(
+                        Status(StatusCode.ERROR, description="session_not_found")
+                    )
+
+                    # Extract session ID if present
+                    import re
+
+                    session_match = re.search(
+                        r"session\s+id[:\s]+([a-f0-9-]+)", error_msg, re.IGNORECASE
+                    )
+                    session_id_info = (
+                        f" (session ID: {session_match.group(1)})"
+                        if session_match
+                        else ""
+                    )
+
+                    user_friendly_msg = (
+                        f"🔄 **Session Not Found**\n\n"
+                        f"The Claude session could not be found or has expired{session_id_info}.\n\n"
+                        f"**What you can do:**\n"
+                        f"• Use `/new` to start a fresh session\n"
+                        f"• Try your request again\n"
+                        f"• Use `/status` to check your current session"
+                    )
+
+                    raise ClaudeProcessError(user_friendly_msg)
+
                 # Generic process error
                 span.set_attribute("claude.error_type", "process_error")
                 span.set_attribute("claude.exit_code", return_code)
