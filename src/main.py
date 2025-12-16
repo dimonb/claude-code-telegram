@@ -23,6 +23,7 @@ from src.config.features import FeatureFlags
 from src.config.loader import load_config
 from src.config.settings import Settings
 from src.exceptions import ConfigurationError
+from src.infra.telemetry.otel import configure_logging, configure_tracing
 from src.security.audit import AuditLogger, InMemoryAuditStorage
 from src.security.auth import (
     AuthenticationManager,
@@ -34,41 +35,6 @@ from src.security.rate_limiter import RateLimiter
 from src.security.validators import SecurityValidator
 from src.storage.facade import Storage
 from src.storage.session_storage import SQLiteSessionStorage
-
-
-def setup_logging(debug: bool = False) -> None:
-    """Configure structured logging."""
-    level = logging.DEBUG if debug else logging.INFO
-
-    # Configure standard logging
-    logging.basicConfig(
-        level=level,
-        format="%(message)s",
-        stream=sys.stdout,
-    )
-
-    # Configure structlog
-    structlog.configure(
-        processors=[
-            structlog.stdlib.filter_by_level,
-            structlog.stdlib.add_logger_name,
-            structlog.stdlib.add_log_level,
-            structlog.stdlib.PositionalArgumentsFormatter(),
-            structlog.processors.TimeStamper(fmt="iso"),
-            structlog.processors.StackInfoRenderer(),
-            structlog.processors.format_exc_info,
-            structlog.processors.UnicodeDecoder(),
-            (
-                structlog.processors.JSONRenderer()
-                if not debug
-                else structlog.dev.ConsoleRenderer()
-            ),
-        ],
-        context_class=dict,
-        logger_factory=structlog.stdlib.LoggerFactory(),
-        wrapper_class=structlog.stdlib.BoundLogger,
-        cache_logger_on_first_use=True,
-    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -231,16 +197,16 @@ async def run_application(app: Dict[str, Any]) -> None:
 async def main() -> None:
     """Main application entry point."""
     args = parse_args()
-    setup_logging(debug=args.debug)
-
     logger = structlog.get_logger()
-    logger.info("Starting Claude Code Telegram Bot", version=__version__)
-
     try:
-        # Load configuration
-        from src.config import FeatureFlags, load_config
+        config: Settings = load_config(config_file=args.config_file)
 
-        config = load_config(config_file=args.config_file)
+        # Configure logging and telemetry before creating components
+        configure_logging(config)
+        configure_tracing(config)
+
+        logger.info("Starting Claude Code Telegram Bot", version=__version__)
+
         features = FeatureFlags(config)
 
         logger.info(

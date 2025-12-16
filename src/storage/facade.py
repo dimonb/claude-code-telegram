@@ -7,9 +7,12 @@ from datetime import datetime
 from typing import Any, Dict, Optional
 
 import structlog
+from opentelemetry import trace
 
 from ..claude.integration import ClaudeResponse
 from .database import DatabaseManager
+
+tracer = trace.get_tracer("storage.facade")
 from .models import (
     AuditLogModel,
     MessageModel,
@@ -61,6 +64,7 @@ class Storage:
 
     # High-level operations
 
+    @tracer.start_as_current_span("storage.save_interaction")
     async def save_claude_interaction(
         self,
         user_id: int,
@@ -70,6 +74,14 @@ class Storage:
         ip_address: Optional[str] = None,
     ):
         """Save complete Claude interaction."""
+        span = trace.get_current_span()
+        span.set_attribute("storage.user_id", user_id)
+        span.set_attribute("storage.session_id", session_id)
+        span.set_attribute("storage.cost", response.cost)
+        span.set_attribute("storage.duration_ms", response.duration_ms)
+        span.set_attribute("storage.tools_count", len(response.tools_used or []))
+        span.set_attribute("storage.is_error", response.is_error)
+
         logger.info(
             "Saving Claude interaction",
             user_id=user_id,

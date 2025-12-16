@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import structlog
+from opentelemetry import trace
+from opentelemetry.trace import Status, StatusCode
 
 from ..config.settings import Settings
 from .exceptions import ClaudeToolValidationError
@@ -16,6 +18,7 @@ from .sdk_integration import ClaudeSDKManager
 from .session import SessionManager
 
 logger = structlog.get_logger()
+tracer = trace.get_tracer("claude.facade")
 
 
 class ClaudeIntegration:
@@ -129,99 +132,133 @@ class ClaudeIntegration:
                 except Exception as e:
                     logger.warning("Stream callback failed", error=str(e))
 
-        # Execute command
-        try:
-            # Only continue session if it's not a new session
-            should_continue = bool(session_id) and not getattr(
-                session, "is_new_session", False
-            )
+        tracer_span = tracer.start_as_current_span("claude.run_command")
+        with tracer_span as span:
+            span.set_attribute("user_id", user_id)
+            span.set_attribute("working_directory", str(working_directory))
+            span.set_attribute("has_session_id", bool(session_id))
+            span.set_attribute("prompt_length", len(prompt))
+            span.set_attribute("use_sdk", bool(self.sdk_manager))
+            span.set_attribute("use_subprocess", bool(self.process_manager))
 
-            # For new sessions, don't pass the temporary session_id to Claude Code
-            claude_session_id = (
-                None
-                if getattr(session, "is_new_session", False)
-                else session.session_id
-            )
-
-            response = await self._execute_with_fallback(
-                prompt=prompt,
-                working_directory=working_directory,
-                session_id=claude_session_id,
-                continue_session=should_continue,
-                stream_callback=stream_handler,
-            )
-
-            # Check if tool validation failed
-            if not tools_validated:
-                logger.error(
-                    "Command completed but tool validation failed",
-                    validation_errors=validation_errors,
+            try:
+                # Only continue session if it's not a new session
+                should_continue = bool(session_id) and not getattr(
+                    session, "is_new_session", False
                 )
-                # Mark response as having errors and include validation details
-                response.is_error = True
-                response.error_type = "tool_validation_failed"
 
-                # Extract blocked tool names for user feedback
-                blocked_tools = []
-                for error in validation_errors:
-                    if "Tool not allowed:" in error:
-                        tool_name = error.split("Tool not allowed: ")[1]
-                        blocked_tools.append(tool_name)
+                # For new sessions, do not pass the temporary session_id to Claude Code
+                claude_session_id = (
+                    None
+                    if getattr(session, "is_new_session", False)
+                    else session.session_id
+                )
 
-                # Create user-friendly error message
-                if blocked_tools:
-                    tool_list = ", ".join(f"`{tool}`" for tool in blocked_tools)
-                    response.content = (
-                        f"🚫 **Tool Access Blocked**\n\n"
-                        f"Claude tried to use tools not allowed:\n"
-                        f"{tool_list}\n\n"
-                        f"**What you can do:**\n"
-                        f"• Contact the administrator to request access to these tools\n"
-                        f"• Try rephrasing your request to use different approaches\n"
-                        f"• Check what tools are currently available with `/status`\n\n"
-                        f"**Currently allowed tools:**\n"
-                        f"{', '.join(f'`{t}`' for t in self.config.claude_allowed_tools or [])}"
+                response = await self._execute_with_fallback(
+                    prompt=prompt,
+                    working_directory=working_directory,
+                    session_id=claude_session_id,
+                    continue_session=should_continue,
+                    stream_callback=stream_handler,
+                )
+
+                # Check if tool validation failed
+                if not tools_validated:
+                    logger.error(
+                        "Command completed but tool validation failed",
+                        validation_errors=validation_errors,
                     )
+                    # Mark response as having errors and include validation details
+                    response.is_error = True
+                    response.error_type = "tool_validation_failed"
+
+                    # Extract blocked tool names for user feedback
+                    blocked_tools_list = []
+                    for error in validation_errors:
+                        if "Tool not allowed:" in error:
+                            tool_name = error.split("Tool not allowed: ")[1]
+                            blocked_tools_list.append(tool_name)
+
+                    # Create user-friendly error message
+                    if blocked_tools_list:
+                        tool_list = ", ".join(
+                            f"`{tool}`" for tool in blocked_tools_list
+                        )
+                        response.content = (
+                            f"🚫 **Tool Access Blocked**\n\n"
+                            f"Claude tried to use tools not allowed:\n"
+                            f"{tool_list}\n\n"
+                            f"**What you can do:**\n"
+                            f"• Contact the administrator to request access to these tools\n"
+                            f"• Try rephrasing your request to use different approaches\n"
+                            f"• Check what tools are currently available with `/status`\n\n"
+                            f"**Currently allowed tools:**\n"
+                            f"{', '.join(f'`{t}`' for t in self.config.claude_allowed_tools or [])}"
+                        )
+                    else:
+                        response.content = (
+                            f"🚫 **Tool Validation Failed**\n\n"
+                            f"Tools failed security validation. Try different approach.\n\n"
+                            f"Details: {'; '.join(validation_errors)}"
+                        )
+
+                # Update session (this may change the session_id for new sessions)
+                old_session_id = session.session_id
+                await self.session_manager.update_session(session.session_id, response)
+
+                # For new sessions, get the updated session_id from the session manager
+                if hasattr(session, "is_new_session") and response.session_id:
+                    # The session_id has been updated to Claude's session_id
+                    final_session_id = response.session_id
                 else:
-                    response.content = (
-                        f"🚫 **Tool Validation Failed**\n\n"
-                        f"Tools failed security validation. Try different approach.\n\n"
-                        f"Details: {'; '.join(validation_errors)}"
+                    # Use the original session_id for continuing sessions
+                    final_session_id = old_session_id
+
+                # Ensure response has the correct session_id
+                response.session_id = final_session_id
+
+                # Add result attributes to span
+                span.set_attribute("claude.session_id", response.session_id or "")
+                span.set_attribute("claude.cost_usd", response.cost)
+                span.set_attribute("claude.duration_ms", response.duration_ms)
+                span.set_attribute("claude.num_turns", response.num_turns)
+                span.set_attribute("claude.is_error", response.is_error)
+                span.set_attribute(
+                    "claude.tools_used",
+                    ",".join(t.get("name", "") for t in (response.tools_used or [])),
+                )
+                span.set_attribute(
+                    "claude.response_length", len(response.content or "")
+                )
+
+                logger.info(
+                    "Claude command completed",
+                    session_id=response.session_id,
+                    cost=response.cost,
+                    duration_ms=response.duration_ms,
+                    num_turns=response.num_turns,
+                    is_error=response.is_error,
+                )
+
+                if response.is_error:
+                    span.set_status(
+                        Status(
+                            StatusCode.ERROR,
+                            description=response.error_type or "unknown_error",
+                        )
                     )
 
-            # Update session (this may change the session_id for new sessions)
-            old_session_id = session.session_id
-            await self.session_manager.update_session(session.session_id, response)
+                return response
 
-            # For new sessions, get the updated session_id from the session manager
-            if hasattr(session, "is_new_session") and response.session_id:
-                # The session_id has been updated to Claude's session_id
-                final_session_id = response.session_id
-            else:
-                # Use the original session_id for continuing sessions
-                final_session_id = old_session_id
-
-            # Ensure response has the correct session_id
-            response.session_id = final_session_id
-
-            logger.info(
-                "Claude command completed",
-                session_id=response.session_id,
-                cost=response.cost,
-                duration_ms=response.duration_ms,
-                num_turns=response.num_turns,
-                is_error=response.is_error,
-            )
-
-            return response
-
-        except Exception as e:
-            logger.exception(
-                "Claude command failed",
-                user_id=user_id,
-                session_id=session.session_id,
-            )
-            raise
+            except Exception as e:
+                span.record_exception(e)
+                span.set_status(Status(StatusCode.ERROR, description=str(e)))
+                logger.exception(
+                    "Claude command failed",
+                    user_id=user_id,
+                    session_id=session.session_id,
+                )
+                raise
 
     async def _execute_with_fallback(
         self,

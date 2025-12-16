@@ -17,6 +17,8 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional
 
 import structlog
+from opentelemetry import trace
+from opentelemetry.trace import Status, StatusCode
 
 from ..config.settings import Settings
 from .exceptions import (
@@ -26,6 +28,7 @@ from .exceptions import (
 )
 
 logger = structlog.get_logger()
+tracer = trace.get_tracer("claude.subprocess")
 
 
 @dataclass
@@ -125,53 +128,75 @@ class ClaudeProcessManager:
             continue_session=continue_session,
         )
 
-        try:
-            # Start process
-            process = await self._start_process(cmd, working_directory)
-            self.active_processes[process_id] = process
+        with tracer.start_as_current_span("claude.subprocess.execute") as span:
+            span.set_attribute("process_id", process_id)
+            span.set_attribute("cwd", str(working_directory))
+            span.set_attribute("session_id", session_id or "")
+            span.set_attribute("continue_session", continue_session)
+            span.set_attribute("cmd_args", " ".join(cmd[:10]))
 
-            # Handle output with timeout
-            result = await asyncio.wait_for(
-                self._handle_process_output(process, stream_callback),
-                timeout=self.config.claude_timeout_seconds,
-            )
+            try:
+                # Start process
+                process = await self._start_process(cmd, working_directory)
+                self.active_processes[process_id] = process
 
-            logger.info(
-                "Claude Code process completed successfully",
-                process_id=process_id,
-                cost=result.cost,
-                duration_ms=result.duration_ms,
-            )
+                # Handle output with timeout
+                result = await asyncio.wait_for(
+                    self._handle_process_output(process, stream_callback),
+                    timeout=self.config.claude_timeout_seconds,
+                )
 
-            return result
+                logger.info(
+                    "Claude Code process completed successfully",
+                    process_id=process_id,
+                    cost=result.cost,
+                    duration_ms=result.duration_ms,
+                )
 
-        except asyncio.TimeoutError:
-            # Kill process on timeout
-            if process_id in self.active_processes:
-                self.active_processes[process_id].kill()
-                await self.active_processes[process_id].wait()
+                return result
 
-            logger.error(
-                "Claude Code process timed out",
-                process_id=process_id,
-                timeout_seconds=self.config.claude_timeout_seconds,
-            )
+            except asyncio.TimeoutError as e:
+                # Kill process on timeout
+                if process_id in self.active_processes:
+                    self.active_processes[process_id].kill()
+                    await self.active_processes[process_id].wait()
 
-            raise ClaudeTimeoutError(
-                f"Claude Code timed out after {self.config.claude_timeout_seconds}s"
-            )
+                span.record_exception(e)
+                span.set_status(
+                    Status(
+                        StatusCode.ERROR,
+                        description="claude_subprocess_timeout",
+                    )
+                )
 
-        except Exception as e:
-            logger.exception(
-                "Claude Code process failed",
-                process_id=process_id,
-            )
-            raise
+                logger.error(
+                    "Claude Code process timed out",
+                    process_id=process_id,
+                    timeout_seconds=self.config.claude_timeout_seconds,
+                )
 
-        finally:
-            # Clean up
-            if process_id in self.active_processes:
-                del self.active_processes[process_id]
+                raise ClaudeTimeoutError(
+                    f"Claude Code timed out after {self.config.claude_timeout_seconds}s"
+                )
+
+            except Exception as e:
+                span.record_exception(e)
+                span.set_status(
+                    Status(
+                        StatusCode.ERROR,
+                        description=f"claude_subprocess_error: {type(e).__name__}",
+                    )
+                )
+                logger.exception(
+                    "Claude Code process failed",
+                    process_id=process_id,
+                )
+                raise
+
+            finally:
+                # Clean up
+                if process_id in self.active_processes:
+                    del self.active_processes[process_id]
 
     def _build_command(
         self, prompt: str, session_id: Optional[str], continue_session: bool
@@ -228,102 +253,140 @@ class ClaudeProcessManager:
         self, process: Process, stream_callback: Optional[Callable]
     ) -> ClaudeResponse:
         """Memory-optimized output handling with bounded buffers."""
-        message_buffer = deque(maxlen=self.max_message_buffer)
-        result = None
-        parsing_errors = []
+        with tracer.start_as_current_span("claude.subprocess.output") as span:
+            message_buffer = deque(maxlen=self.max_message_buffer)
+            result = None
+            parsing_errors = []
+            message_count = 0
+            tool_count = 0
 
-        async for line in self._read_stream_bounded(process.stdout):
-            try:
-                msg = json.loads(line)
+            async for line in self._read_stream_bounded(process.stdout):
+                try:
+                    msg = json.loads(line)
 
-                # Enhanced validation
-                if not self._validate_message_structure(msg):
-                    parsing_errors.append(f"Invalid message structure: {line[:100]}")
+                    # Enhanced validation
+                    if not self._validate_message_structure(msg):
+                        parsing_errors.append(
+                            f"Invalid message structure: {line[:100]}"
+                        )
+                        continue
+
+                    message_buffer.append(msg)
+                    message_count += 1
+
+                    # Track tool usage with spans
+                    if msg.get("type") == "assistant":
+                        message_content = msg.get("message", {})
+                        for block in message_content.get("content", []):
+                            if block.get("type") == "tool_use":
+                                tool_count += 1
+                                tool_name = block.get("name", "unknown")
+                                with tracer.start_as_current_span(
+                                    f"claude.tool.{tool_name}"
+                                ) as tool_span:
+                                    tool_span.set_attribute("tool.name", tool_name)
+                                    tool_span.set_attribute(
+                                        "tool.input",
+                                        str(block.get("input", {}))[:500],
+                                    )
+
+                    # Process immediately to avoid memory buildup
+                    update = self._parse_stream_message(msg)
+                    if update and stream_callback:
+                        try:
+                            await stream_callback(update)
+                        except Exception as e:
+                            logger.warning(
+                                "Stream callback failed",
+                                error=str(e),
+                                update_type=update.type,
+                            )
+
+                    # Check for final result
+                    if msg.get("type") == "result":
+                        result = msg
+
+                except json.JSONDecodeError as e:
+                    parsing_errors.append(f"JSON decode error: {e}")
+                    logger.warning(
+                        "Failed to parse JSON line", line=line[:200], error=str(e)
+                    )
                     continue
 
-                message_buffer.append(msg)
+            span.set_attribute("message_count", message_count)
+            span.set_attribute("tool_count", tool_count)
+            span.set_attribute("parsing_errors", len(parsing_errors))
 
-                # Process immediately to avoid memory buildup
-                update = self._parse_stream_message(msg)
-                if update and stream_callback:
-                    try:
-                        await stream_callback(update)
-                    except Exception as e:
-                        logger.warning(
-                            "Stream callback failed",
-                            error=str(e),
-                            update_type=update.type,
-                        )
-
-                # Check for final result
-                if msg.get("type") == "result":
-                    result = msg
-
-            except json.JSONDecodeError as e:
-                parsing_errors.append(f"JSON decode error: {e}")
+            # Enhanced error reporting
+            if parsing_errors:
                 logger.warning(
-                    "Failed to parse JSON line", line=line[:200], error=str(e)
-                )
-                continue
-
-        # Enhanced error reporting
-        if parsing_errors:
-            logger.warning(
-                "Parsing errors encountered",
-                count=len(parsing_errors),
-                errors=parsing_errors[:5],
-            )
-
-        # Wait for process to complete
-        return_code = await process.wait()
-
-        if return_code != 0:
-            stderr = await process.stderr.read()
-            error_msg = stderr.decode("utf-8", errors="replace")
-            logger.error(
-                "Claude Code process failed",
-                return_code=return_code,
-                stderr=error_msg,
-            )
-
-            # Check for specific error types
-            if "usage limit reached" in error_msg.lower():
-                # Extract reset time if available
-                import re
-
-                time_match = re.search(
-                    r"reset at (\d+[apm]+)", error_msg, re.IGNORECASE
-                )
-                timezone_match = re.search(r"\(([^)]+)\)", error_msg)
-
-                reset_time = time_match.group(1) if time_match else "later"
-                timezone = timezone_match.group(1) if timezone_match else ""
-
-                user_friendly_msg = (
-                    f"⏱️ **Claude AI Usage Limit Reached**\n\n"
-                    f"You've reached your Claude AI usage limit for this period.\n\n"
-                    f"**When will it reset?**\n"
-                    f"Your limit will reset at **{reset_time}**"
-                    f"{f' ({timezone})' if timezone else ''}\n\n"
-                    f"**What you can do:**\n"
-                    f"• Wait for the limit to reset automatically\n"
-                    f"• Try again after the reset time\n"
-                    f"• Use simpler requests that require less processing\n"
-                    f"• Contact support if you need a higher limit"
+                    "Parsing errors encountered",
+                    count=len(parsing_errors),
+                    errors=parsing_errors[:5],
                 )
 
-                raise ClaudeProcessError(user_friendly_msg)
+            # Wait for process to complete
+            return_code = await process.wait()
 
-            # Generic error handling for other cases
-            raise ClaudeProcessError(
-                f"Claude Code exited with code {return_code}: {error_msg}"
-            )
+            if return_code != 0:
+                stderr = await process.stderr.read()
+                error_msg = stderr.decode("utf-8", errors="replace")
+                logger.error(
+                    "Claude Code process failed",
+                    return_code=return_code,
+                    stderr=error_msg,
+                )
 
-        if not result:
-            logger.error("No result message received from Claude Code")
-            raise ClaudeParsingError("No result message received from Claude Code")
+                # Check for specific error types
+                if "usage limit reached" in error_msg.lower():
+                    import re
 
-        return self._parse_result(result, list(message_buffer))
+                    time_match = re.search(
+                        r"reset at (\d+[apm]+)", error_msg, re.IGNORECASE
+                    )
+                    timezone_match = re.search(r"\(([^)]+)\)", error_msg)
+
+                    reset_time = time_match.group(1) if time_match else "later"
+                    timezone = timezone_match.group(1) if timezone_match else ""
+
+                    # Add span attributes for usage limit error
+                    span.set_attribute("claude.error_type", "usage_limit_reached")
+                    span.set_attribute("claude.limit_reset_time", reset_time)
+                    span.set_attribute("claude.limit_timezone", timezone)
+                    span.set_status(
+                        Status(StatusCode.ERROR, description="usage_limit_reached")
+                    )
+
+                    user_friendly_msg = (
+                        f"⏱️ **Claude AI Usage Limit Reached**\n\n"
+                        f"You've reached your Claude AI usage limit for this period.\n\n"
+                        f"**When will it reset?**\n"
+                        f"Your limit will reset at **{reset_time}**"
+                        f"{f' ({timezone})' if timezone else ''}\n\n"
+                        f"**What you can do:**\n"
+                        f"• Wait for the limit to reset automatically\n"
+                        f"• Try again after the reset time\n"
+                        f"• Use simpler requests that require less processing\n"
+                        f"• Contact support if you need a higher limit"
+                    )
+
+                    raise ClaudeProcessError(user_friendly_msg)
+
+                # Generic process error
+                span.set_attribute("claude.error_type", "process_error")
+                span.set_attribute("claude.exit_code", return_code)
+                span.set_status(
+                    Status(StatusCode.ERROR, description=f"exit_code_{return_code}")
+                )
+                raise ClaudeProcessError(
+                    f"Claude Code exited with code {return_code}: {error_msg}"
+                )
+
+            if not result:
+                logger.error("No result message received from Claude Code")
+                raise ClaudeParsingError("No result message received from Claude Code")
+
+            return self._parse_result(result, list(message_buffer))
 
     async def _read_stream(self, stream) -> AsyncIterator[str]:
         """Read lines from stream."""

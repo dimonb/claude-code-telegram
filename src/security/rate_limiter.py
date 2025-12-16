@@ -14,10 +14,12 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, Optional, Tuple
 
 import structlog
+from opentelemetry import trace
 
 from ..config.settings import Settings
 
 logger = structlog.get_logger()
+tracer = trace.get_tracer("security.rate_limiter")
 
 
 @dataclass
@@ -88,14 +90,22 @@ class RateLimiter:
             refill_rate=self.refill_rate,
         )
 
+    @tracer.start_as_current_span("rate_limit.check")
     async def check_rate_limit(
         self, user_id: int, cost: float = 1.0, tokens: int = 1
     ) -> Tuple[bool, Optional[str]]:
         """Check if request is allowed under rate limits."""
+        span = trace.get_current_span()
+        span.set_attribute("rate_limit.user_id", user_id)
+        span.set_attribute("rate_limit.cost", cost)
+        span.set_attribute("rate_limit.tokens", tokens)
+
         async with self.locks[user_id]:
             # Check request rate limit
             rate_allowed, rate_message = self._check_request_rate(user_id, tokens)
+            span.set_attribute("rate_limit.request_allowed", rate_allowed)
             if not rate_allowed:
+                span.set_attribute("rate_limit.limit_type", "request_rate")
                 logger.warning(
                     "Request rate limit exceeded",
                     user_id=user_id,
@@ -105,7 +115,12 @@ class RateLimiter:
 
             # Check cost limit
             cost_allowed, cost_message = self._check_cost_limit(user_id, cost)
+            span.set_attribute("rate_limit.cost_allowed", cost_allowed)
+            span.set_attribute(
+                "rate_limit.current_cost", self.cost_tracker.get(user_id, 0.0)
+            )
             if not cost_allowed:
+                span.set_attribute("rate_limit.limit_type", "cost")
                 logger.warning(
                     "Cost limit exceeded",
                     user_id=user_id,
@@ -118,6 +133,7 @@ class RateLimiter:
             self._consume_request_tokens(user_id, tokens)
             self._track_cost(user_id, cost)
 
+            span.set_attribute("rate_limit.allowed", True)
             logger.debug(
                 "Rate limit check passed", user_id=user_id, cost=cost, tokens=tokens
             )

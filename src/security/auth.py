@@ -15,12 +15,14 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 import structlog
+from opentelemetry import trace
 
 from src.exceptions import SecurityError
 
 # from src.exceptions import AuthenticationError  # Future use
 
 logger = structlog.get_logger()
+tracer = trace.get_tracer("security.auth")
 
 
 @dataclass
@@ -229,10 +231,15 @@ class AuthenticationManager:
         self.sessions: Dict[int, UserSession] = {}
         logger.info("Authentication manager initialized", providers=len(self.providers))
 
+    @tracer.start_as_current_span("auth.authenticate")
     async def authenticate_user(
         self, user_id: int, credentials: Optional[Dict[str, Any]] = None
     ) -> bool:
         """Try authentication with all providers."""
+        span = trace.get_current_span()
+        span.set_attribute("auth.user_id", user_id)
+        span.set_attribute("auth.providers_count", len(self.providers))
+
         credentials = credentials or {}
 
         # Clean expired sessions first
@@ -240,22 +247,34 @@ class AuthenticationManager:
 
         # Try each provider
         for provider in self.providers:
-            try:
-                if await provider.authenticate(user_id, credentials):
-                    await self._create_session(user_id, provider)
-                    logger.info(
-                        "User authenticated successfully",
+            provider_name = provider.__class__.__name__
+            with tracer.start_as_current_span(
+                f"auth.provider.{provider_name}"
+            ) as provider_span:
+                provider_span.set_attribute("auth.provider", provider_name)
+                try:
+                    if await provider.authenticate(user_id, credentials):
+                        await self._create_session(user_id, provider)
+                        span.set_attribute("auth.success", True)
+                        span.set_attribute("auth.provider_used", provider_name)
+                        provider_span.set_attribute("auth.success", True)
+                        logger.info(
+                            "User authenticated successfully",
+                            user_id=user_id,
+                            provider=provider_name,
+                        )
+                        return True
+                    else:
+                        provider_span.set_attribute("auth.success", False)
+                except Exception as e:
+                    provider_span.set_attribute("auth.error", str(e))
+                    logger.exception(
+                        "Authentication provider error",
                         user_id=user_id,
-                        provider=provider.__class__.__name__,
+                        provider=provider_name,
                     )
-                    return True
-            except Exception as e:
-                logger.exception(
-                    "Authentication provider error",
-                    user_id=user_id,
-                    provider=provider.__class__.__name__,
-                )
 
+        span.set_attribute("auth.success", False)
         logger.warning("Authentication failed for user", user_id=user_id)
         return False
 

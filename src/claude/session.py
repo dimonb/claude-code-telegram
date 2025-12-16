@@ -14,8 +14,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 import structlog
+from opentelemetry import trace
 
 from ..config.settings import Settings
+
+tracer = trace.get_tracer("claude.session")
 
 if TYPE_CHECKING:
     from .integration import ClaudeResponse as CLIClaudeResponse
@@ -160,6 +163,7 @@ class SessionManager:
         self.storage = storage
         self.active_sessions: Dict[str, ClaudeSession] = {}
 
+    @tracer.start_as_current_span("session.get_or_create")
     async def get_or_create_session(
         self,
         user_id: int,
@@ -167,6 +171,13 @@ class SessionManager:
         session_id: Optional[str] = None,
     ) -> ClaudeSession:
         """Get existing session or create new one."""
+        span = trace.get_current_span()
+        span.set_attribute("session.user_id", user_id)
+        span.set_attribute("session.project_path", str(project_path))
+        span.set_attribute("session.has_session_id", bool(session_id))
+        if session_id:
+            span.set_attribute("session.session_id", session_id)
+
         logger.info(
             "Getting or creating session",
             user_id=user_id,
@@ -178,6 +189,8 @@ class SessionManager:
         if session_id and session_id in self.active_sessions:
             session = self.active_sessions[session_id]
             if not session.is_expired(self.config.session_timeout_hours):
+                span.set_attribute("session.source", "memory_cache")
+                span.set_attribute("session.found", True)
                 logger.debug("Using active session", session_id=session_id)
                 return session
 
@@ -185,6 +198,8 @@ class SessionManager:
         if session_id:
             session = await self.storage.load_session(session_id)
             if session and not session.is_expired(self.config.session_timeout_hours):
+                span.set_attribute("session.source", "storage")
+                span.set_attribute("session.found", True)
                 self.active_sessions[session_id] = session
                 logger.info("Loaded session from storage", session_id=session_id)
                 return session
@@ -218,6 +233,11 @@ class SessionManager:
         await self.storage.save_session(new_session)
         self.active_sessions[new_session.session_id] = new_session
 
+        span.set_attribute("session.source", "new")
+        span.set_attribute("session.found", False)
+        span.set_attribute("session.session_id", new_session.session_id)
+        span.set_attribute("session.is_new", True)
+
         logger.info(
             "Created new session",
             session_id=new_session.session_id,
@@ -227,8 +247,15 @@ class SessionManager:
 
         return new_session
 
+    @tracer.start_as_current_span("session.update")
     async def update_session(self, session_id: str, response: ClaudeResponse) -> None:
         """Update session with response data."""
+        span = trace.get_current_span()
+        span.set_attribute("session.session_id", session_id)
+        span.set_attribute("session.cost", response.cost)
+        span.set_attribute("session.num_turns", response.num_turns)
+        span.set_attribute("session.is_error", response.is_error)
+
         if session_id in self.active_sessions:
             session = self.active_sessions[session_id]
             old_session_id = session.session_id

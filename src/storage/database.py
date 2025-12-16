@@ -14,8 +14,10 @@ from typing import AsyncIterator, List, Tuple
 
 import aiosqlite
 import structlog
+from opentelemetry import trace
 
 logger = structlog.get_logger()
+tracer = trace.get_tracer("storage.database")
 
 # Initial schema migration
 INITIAL_SCHEMA = """
@@ -246,22 +248,29 @@ class DatabaseManager:
     @asynccontextmanager
     async def get_connection(self) -> AsyncIterator[aiosqlite.Connection]:
         """Get database connection from pool."""
-        async with self._pool_lock:
-            if self._connection_pool:
-                conn = self._connection_pool.pop()
-            else:
-                conn = await aiosqlite.connect(self.database_path)
-                conn.row_factory = aiosqlite.Row
-                await conn.execute("PRAGMA foreign_keys = ON")
+        with tracer.start_as_current_span("db.connection.get") as span:
+            span.set_attribute("db.system", "sqlite")
+            span.set_attribute("db.name", str(self.database_path.name))
 
-        try:
-            yield conn
-        finally:
             async with self._pool_lock:
-                if len(self._connection_pool) < self._pool_size:
-                    self._connection_pool.append(conn)
+                from_pool = bool(self._connection_pool)
+                if self._connection_pool:
+                    conn = self._connection_pool.pop()
                 else:
-                    await conn.close()
+                    conn = await aiosqlite.connect(self.database_path)
+                    conn.row_factory = aiosqlite.Row
+                    await conn.execute("PRAGMA foreign_keys = ON")
+
+                span.set_attribute("db.connection.from_pool", from_pool)
+
+            try:
+                yield conn
+            finally:
+                async with self._pool_lock:
+                    if len(self._connection_pool) < self._pool_size:
+                        self._connection_pool.append(conn)
+                    else:
+                        await conn.close()
 
     async def close(self):
         """Close all connections in pool."""

@@ -4,6 +4,8 @@ import asyncio
 from typing import Optional
 
 import structlog
+from opentelemetry import trace
+from opentelemetry.trace import Status, StatusCode
 from telegram import Update
 from telegram.ext import ContextTypes
 
@@ -14,6 +16,7 @@ from ...security.rate_limiter import RateLimiter
 from ...security.validators import SecurityValidator
 
 logger = structlog.get_logger()
+tracer = trace.get_tracer("telegram.handlers")
 
 
 async def _format_progress_update(update_obj) -> Optional[str]:
@@ -138,229 +141,352 @@ async def handle_text_message(
     # Get services
     rate_limiter: Optional[RateLimiter] = context.bot_data.get("rate_limiter")
     audit_logger: Optional[AuditLogger] = context.bot_data.get("audit_logger")
+    claude_response = None
 
     logger.info(
         "Processing text message", user_id=user_id, message_length=len(message_text)
     )
 
-    try:
-        # Check rate limit with estimated cost for text processing
-        estimated_cost = _estimate_text_processing_cost(message_text)
+    with tracer.start_as_current_span("telegram.handle_text") as span:
+        progress_msg = None
+        try:
+            span.set_attribute("telegram.user_id", user_id)
+            if update.effective_chat:
+                span.set_attribute("telegram.chat_id", update.effective_chat.id)
+            span.set_attribute("telegram.message_length", len(message_text))
 
-        if rate_limiter:
-            allowed, limit_message = await rate_limiter.check_rate_limit(
-                user_id, estimated_cost
+            current_dir = context.user_data.get(
+                "current_directory", settings.approved_directory
             )
-            if not allowed:
-                await update.message.reply_text(f"⏱️ {limit_message}")
+            span.set_attribute("working_directory", str(current_dir))
+
+            # Check rate limit with estimated cost for text processing
+            estimated_cost = _estimate_text_processing_cost(message_text)
+
+            if rate_limiter:
+                allowed, limit_message = await rate_limiter.check_rate_limit(
+                    user_id, estimated_cost
+                )
+                if not allowed:
+                    await update.message.reply_text(f"⏱️ {limit_message}")
+                    return
+
+            # Send typing indicator
+            await update.message.chat.send_action("typing")
+
+            # Create progress message
+            progress_msg = await update.message.reply_text(
+                "🤔 Processing your request...",
+                reply_to_message_id=update.message.message_id,
+            )
+
+            # Get Claude integration and storage from context
+            claude_integration = context.bot_data.get("claude_integration")
+            storage = context.bot_data.get("storage")
+
+            if not claude_integration:
+                await update.message.reply_text(
+                    "❌ **Claude integration not available**\n\n"
+                    "The Claude Code integration is not properly configured. "
+                    "Please contact the administrator.",
+                    parse_mode="Markdown",
+                )
                 return
 
-        # Send typing indicator
-        await update.message.chat.send_action("typing")
+            # Get existing session ID
+            session_id = context.user_data.get("claude_session_id")
 
-        # Create progress message
-        progress_msg = await update.message.reply_text(
-            "🤔 Processing your request...",
-            reply_to_message_id=update.message.message_id,
-        )
-
-        # Get Claude integration and storage from context
-        claude_integration = context.bot_data.get("claude_integration")
-        storage = context.bot_data.get("storage")
-
-        if not claude_integration:
-            await update.message.reply_text(
-                "❌ **Claude integration not available**\n\n"
-                "The Claude Code integration is not properly configured. "
-                "Please contact the administrator.",
-                parse_mode="Markdown",
-            )
-            return
-
-        # Get current directory
-        current_dir = context.user_data.get(
-            "current_directory", settings.approved_directory
-        )
-
-        # Get existing session ID
-        session_id = context.user_data.get("claude_session_id")
-
-        # Enhanced stream updates handler with progress tracking
-        async def stream_handler(update_obj):
-            try:
-                progress_text = await _format_progress_update(update_obj)
-                if progress_text:
-                    await progress_msg.edit_text(progress_text, parse_mode="Markdown")
-            except Exception as e:
-                logger.warning("Failed to update progress message", error=str(e))
-
-        # Run Claude command
-        try:
-            claude_response = await claude_integration.run_command(
-                prompt=message_text,
-                working_directory=current_dir,
-                user_id=user_id,
-                session_id=session_id,
-                on_stream=stream_handler,
-            )
-
-            # Update session ID
-            context.user_data["claude_session_id"] = claude_response.session_id
-
-            # Check if Claude changed the working directory and update our tracking
-            _update_working_directory_from_claude_response(
-                claude_response, context, settings, user_id
-            )
-
-            # Log interaction to storage
-            if storage:
+            # Enhanced stream updates handler with progress tracking
+            async def stream_handler(update_obj):
                 try:
-                    await storage.save_claude_interaction(
-                        user_id=user_id,
-                        session_id=claude_response.session_id,
-                        prompt=message_text,
-                        response=claude_response,
-                        ip_address=None,  # Telegram doesn't provide IP
+                    # Check for usage limit in stream content
+                    if (
+                        update_obj.content
+                        and "limit reached" in update_obj.content.lower()
+                    ):
+                        import re
+
+                        current_span = trace.get_current_span()
+                        if current_span.is_recording():
+                            content = update_obj.content
+                            time_match = re.search(
+                                r"resets?\s*(\d+[apm]+)", content, re.IGNORECASE
+                            )
+                            timezone_match = re.search(r"\(([^)]+)\)", content)
+
+                            reset_time = time_match.group(1) if time_match else "later"
+                            timezone = timezone_match.group(1) if timezone_match else ""
+
+                            current_span.set_attribute(
+                                "claude.error_type", "usage_limit_reached"
+                            )
+                            current_span.set_attribute(
+                                "claude.limit_reset_time", reset_time
+                            )
+                            current_span.set_attribute(
+                                "claude.limit_timezone", timezone
+                            )
+                            current_span.set_status(
+                                Status(
+                                    StatusCode.ERROR, description="usage_limit_reached"
+                                )
+                            )
+
+                    progress_text = await _format_progress_update(update_obj)
+                    if progress_text:
+                        await progress_msg.edit_text(
+                            progress_text, parse_mode="Markdown"
+                        )
+                except Exception as stream_error:
+                    logger.warning(
+                        "Failed to update progress message", error=str(stream_error)
                     )
-                except Exception as e:
-                    logger.warning("Failed to log interaction to storage", error=str(e))
 
-            # Format response
-            from ..utils.formatting import ResponseFormatter
-
-            formatter = ResponseFormatter(settings)
-            formatted_messages = formatter.format_claude_response(
-                claude_response.content
-            )
-
-        except ClaudeToolValidationError as e:
-            # Tool validation error with detailed instructions
-            logger.error(
-                "Tool validation error",
-                error=str(e),
-                user_id=user_id,
-                blocked_tools=e.blocked_tools,
-            )
-            # Error message already formatted, create FormattedMessage
-            from ..utils.formatting import FormattedMessage
-
-            formatted_messages = [FormattedMessage(str(e), parse_mode="Markdown")]
-        except Exception as e:
-            logger.exception("Claude integration failed", error=str(e), user_id=user_id)
-            # Format error and create FormattedMessage
-            from ..utils.formatting import FormattedMessage
-
-            formatted_messages = [
-                FormattedMessage(_format_error_message(str(e)), parse_mode="Markdown")
-            ]
-
-        # Delete progress message
-        await progress_msg.delete()
-
-        # Send formatted responses (may be multiple messages)
-        for i, message in enumerate(formatted_messages):
+            # Run Claude command
+            claude_response = None  # Initialize to avoid NameError in exception handler
             try:
-                await update.message.reply_text(
-                    message.text,
-                    parse_mode=message.parse_mode,
-                    reply_markup=message.reply_markup,
-                    reply_to_message_id=update.message.message_id if i == 0 else None,
-                )
-
-                # Small delay between messages to avoid rate limits
-                if i < len(formatted_messages) - 1:
-                    await asyncio.sleep(0.5)
-
-            except Exception as e:
-                logger.error(
-                    "Failed to send response message", error=str(e), message_index=i
-                )
-                # Try to send error message
-                await update.message.reply_text(
-                    "❌ Failed to send response. Please try again.",
-                    reply_to_message_id=update.message.message_id if i == 0 else None,
-                )
-
-        # Update session info
-        context.user_data["last_message"] = update.message.text
-
-        # Add conversation enhancements if available
-        features = context.bot_data.get("features")
-        conversation_enhancer = (
-            features.get_conversation_enhancer() if features else None
-        )
-
-        if conversation_enhancer and claude_response:
-            try:
-                # Update conversation context
-                conversation_context = conversation_enhancer.update_context(
-                    session_id=claude_response.session_id,
+                claude_response = await claude_integration.run_command(
+                    prompt=message_text,
+                    working_directory=current_dir,
                     user_id=user_id,
-                    working_directory=str(current_dir),
-                    tools_used=claude_response.tools_used or [],
-                    response_content=claude_response.content,
+                    session_id=session_id,
+                    on_stream=stream_handler,
                 )
 
-                # Check if we should show follow-up suggestions
-                if conversation_enhancer.should_show_suggestions(
-                    claude_response.tools_used or [], claude_response.content
-                ):
-                    # Generate follow-up suggestions
-                    suggestions = conversation_enhancer.generate_follow_up_suggestions(
-                        claude_response.content,
-                        claude_response.tools_used or [],
-                        conversation_context,
+                # Update session ID
+                context.user_data["claude_session_id"] = claude_response.session_id
+
+                # Check if Claude changed the working directory and update our tracking
+                _update_working_directory_from_claude_response(
+                    claude_response, context, settings, user_id
+                )
+
+                # Log interaction to storage
+                if storage:
+                    try:
+                        await storage.save_claude_interaction(
+                            user_id=user_id,
+                            session_id=claude_response.session_id,
+                            prompt=message_text,
+                            response=claude_response,
+                            ip_address=None,  # Telegram doesn't provide IP
+                        )
+                    except Exception as storage_error:
+                        logger.warning(
+                            "Failed to log interaction to storage",
+                            error=str(storage_error),
+                        )
+
+                # Format response
+                from ..utils.formatting import ResponseFormatter
+
+                formatter = ResponseFormatter(settings)
+                formatted_messages = formatter.format_claude_response(
+                    claude_response.content
+                )
+
+            except ClaudeToolValidationError as e:
+                # Tool validation error with detailed instructions
+                logger.error(
+                    "Tool validation error",
+                    error=str(e),
+                    user_id=user_id,
+                    blocked_tools=e.blocked_tools,
+                )
+                # Error message already formatted, create FormattedMessage
+                from ..utils.formatting import FormattedMessage
+
+                formatted_messages = [FormattedMessage(str(e), parse_mode="Markdown")]
+            except Exception as e:
+                logger.exception(
+                    "Claude integration failed", error=str(e), user_id=user_id
+                )
+                # Format error and create FormattedMessage
+                from ..utils.formatting import FormattedMessage
+
+                formatted_messages = [
+                    FormattedMessage(
+                        _format_error_message(str(e)), parse_mode="Markdown"
+                    )
+                ]
+
+            # Delete progress message
+            await progress_msg.delete()
+
+            # Send formatted responses (may be multiple messages)
+            for i, message in enumerate(formatted_messages):
+                try:
+                    await update.message.reply_text(
+                        message.text,
+                        parse_mode=message.parse_mode,
+                        reply_markup=message.reply_markup,
+                        reply_to_message_id=(
+                            update.message.message_id if i == 0 else None
+                        ),
                     )
 
-                    if suggestions:
-                        # Create keyboard with suggestions
-                        suggestion_keyboard = (
-                            conversation_enhancer.create_follow_up_keyboard(suggestions)
+                    # Small delay between messages to avoid rate limits
+                    if i < len(formatted_messages) - 1:
+                        await asyncio.sleep(0.5)
+
+                except Exception as send_error:
+                    logger.error(
+                        "Failed to send response message",
+                        error=str(send_error),
+                        message_index=i,
+                    )
+                    # Try to send error message
+                    await update.message.reply_text(
+                        "❌ Failed to send response. Please try again.",
+                        reply_to_message_id=(
+                            update.message.message_id if i == 0 else None
+                        ),
+                    )
+
+            # Update session info
+            context.user_data["last_message"] = update.message.text
+
+            # Add conversation enhancements if available
+            features = context.bot_data.get("features")
+            conversation_enhancer = (
+                features.get_conversation_enhancer() if features else None
+            )
+
+            if conversation_enhancer and claude_response:
+                try:
+                    # Update conversation context
+                    conversation_enhancer.update_context(user_id, claude_response)
+                    conversation_context = conversation_enhancer.get_or_create_context(
+                        user_id
+                    )
+
+                    # Check if we should show follow-up suggestions
+                    if conversation_enhancer.should_show_suggestions(
+                        claude_response.tools_used or [], claude_response.content
+                    ):
+                        # Generate follow-up suggestions
+                        suggestions = (
+                            conversation_enhancer.generate_follow_up_suggestions(
+                                claude_response.content,
+                                claude_response.tools_used or [],
+                                conversation_context,
+                            )
                         )
 
-                        # Send follow-up suggestions
-                        await update.message.reply_text(
-                            "💡 **What would you like to do next?**",
-                            parse_mode="Markdown",
-                            reply_markup=suggestion_keyboard,
-                        )
+                        if suggestions:
+                            # Create keyboard with suggestions
+                            suggestion_keyboard = (
+                                conversation_enhancer.create_follow_up_keyboard(
+                                    suggestions
+                                )
+                            )
 
-            except Exception as e:
-                logger.warning(
-                    "Conversation enhancement failed", error=str(e), user_id=user_id
+                            # Send follow-up suggestions
+                            await update.message.reply_text(
+                                "💡 **What would you like to do next?**",
+                                parse_mode="Markdown",
+                                reply_markup=suggestion_keyboard,
+                            )
+
+                except Exception as conv_error:
+                    logger.warning(
+                        "Conversation enhancement failed",
+                        error=str(conv_error),
+                        user_id=user_id,
+                    )
+
+            # Log successful message processing
+            if audit_logger:
+                await audit_logger.log_command(
+                    user_id=user_id,
+                    command="text_message",
+                    args=[update.message.text[:100]],  # First 100 chars
+                    success=True,
                 )
 
-        # Log successful message processing
-        if audit_logger:
-            await audit_logger.log_command(
-                user_id=user_id,
-                command="text_message",
-                args=[update.message.text[:100]],  # First 100 chars
-                success=True,
+            logger.info("Text message processed successfully", user_id=user_id)
+
+        except Exception as e:
+            # Clean up progress message if it exists
+            try:
+                if progress_msg is not None:
+                    await progress_msg.delete()
+            except Exception:
+                logger.warning(
+                    "Failed to delete progress message during error handling",
+                    user_id=user_id,
+                )
+
+            if span.is_recording():
+                span.record_exception(e)
+                span.set_status(Status(StatusCode.ERROR, str(e)))
+
+            error_msg = f"❌ **Error processing message**\n\n{str(e)}"
+            await update.message.reply_text(error_msg, parse_mode="Markdown")
+
+            # Log failed processing
+            if audit_logger:
+                await audit_logger.log_command(
+                    user_id=user_id,
+                    command="text_message",
+                    args=[update.message.text[:100]],
+                    success=False,
+                )
+
+            logger.exception(
+                "Error processing text message", error=str(e), user_id=user_id
             )
 
-        logger.info("Text message processed successfully", user_id=user_id)
-
-    except Exception as e:
-        # Clean up progress message if it exists
-        try:
-            await progress_msg.delete()
-        except:
-            pass
-
-        error_msg = f"❌ **Error processing message**\n\n{str(e)}"
-        await update.message.reply_text(error_msg, parse_mode="Markdown")
-
-        # Log failed processing
-        if audit_logger:
-            await audit_logger.log_command(
-                user_id=user_id,
-                command="text_message",
-                args=[update.message.text[:100]],
-                success=False,
+            # Only try conversation enhancement if variables are defined
+            features = context.bot_data.get("features")
+            conversation_enhancer = (
+                features.get_conversation_enhancer() if features else None
             )
 
-        logger.exception("Error processing text message", error=str(e), user_id=user_id)
+            if conversation_enhancer and claude_response:
+                try:
+                    # Update conversation context
+                    conversation_enhancer.update_context(user_id, claude_response)
+                    conversation_context = conversation_enhancer.get_or_create_context(
+                        user_id
+                    )
+
+                    # Check if we should show follow-up suggestions
+                    if conversation_enhancer.should_show_suggestions(
+                        claude_response.tools_used or [], claude_response.content
+                    ):
+                        # Generate follow-up suggestions
+                        suggestions = (
+                            conversation_enhancer.generate_follow_up_suggestions(
+                                claude_response.content,
+                                claude_response.tools_used or [],
+                                conversation_context,
+                            )
+                        )
+
+                        if suggestions:
+                            # Create keyboard with suggestions
+                            suggestion_keyboard = (
+                                conversation_enhancer.create_follow_up_keyboard(
+                                    suggestions
+                                )
+                            )
+
+                            # Send follow-up suggestions
+                            await update.message.reply_text(
+                                "💡 **What would you like to do next?**",
+                                parse_mode="Markdown",
+                                reply_markup=suggestion_keyboard,
+                            )
+
+                except Exception as conv_error:
+                    logger.warning(
+                        "Conversation enhancement failed",
+                        error=str(conv_error),
+                        user_id=user_id,
+                    )
+
+        # No outer exception handler here; errors are handled above per-case.
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -383,250 +509,140 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         file_size=document.file_size,
     )
 
-    try:
-        # Validate filename using security validator
-        if security_validator:
-            valid, error = security_validator.validate_filename(document.file_name)
-            if not valid:
+    with tracer.start_as_current_span("telegram.handle_document") as span:
+        span.set_attribute("telegram.user_id", user_id)
+        if update.effective_chat:
+            span.set_attribute("telegram.chat_id", update.effective_chat.id)
+        span.set_attribute("telegram.file_name", document.file_name or "")
+        span.set_attribute("telegram.file_size", document.file_size or 0)
+        span.set_attribute(
+            "telegram.has_caption",
+            bool(update.message.caption if update.message else ""),
+        )
+
+        progress_msg = None
+        claude_progress_msg = None
+
+        try:
+            # Validate filename using security validator
+            if security_validator:
+                valid, error = security_validator.validate_filename(document.file_name)
+                if not valid:
+                    await update.message.reply_text(
+                        f"❌ **File Upload Rejected**\n\n{error}"
+                    )
+
+                    # Log security violation
+                    if audit_logger:
+                        await audit_logger.log_security_violation(
+                            user_id=user_id,
+                            violation_type="invalid_file_upload",
+                            details=(f"Filename: {document.file_name}, Error: {error}"),
+                            severity="medium",
+                        )
+                    return
+
+            # Check file size limits
+            max_size = 10 * 1024 * 1024  # 10MB
+            if document.file_size > max_size:
                 await update.message.reply_text(
-                    f"❌ **File Upload Rejected**\n\n{error}"
-                )
-
-                # Log security violation
-                if audit_logger:
-                    await audit_logger.log_security_violation(
-                        user_id=user_id,
-                        violation_type="invalid_file_upload",
-                        details=f"Filename: {document.file_name}, Error: {error}",
-                        severity="medium",
-                    )
-                return
-
-        # Check file size limits
-        max_size = 10 * 1024 * 1024  # 10MB
-        if document.file_size > max_size:
-            await update.message.reply_text(
-                f"❌ **File Too Large**\n\n"
-                f"Maximum file size: {max_size // 1024 // 1024}MB\n"
-                f"Your file: {document.file_size / 1024 / 1024:.1f}MB"
-            )
-            return
-
-        # Check rate limit for file processing
-        file_cost = _estimate_file_processing_cost(document.file_size)
-        if rate_limiter:
-            allowed, limit_message = await rate_limiter.check_rate_limit(
-                user_id, file_cost
-            )
-            if not allowed:
-                await update.message.reply_text(f"⏱️ {limit_message}")
-                return
-
-        # Send processing indicator
-        await update.message.chat.send_action("upload_document")
-
-        progress_msg = await update.message.reply_text(
-            f"📄 Processing file: `{document.file_name}`...", parse_mode="Markdown"
-        )
-
-        # Check if enhanced file handler is available
-        features = context.bot_data.get("features")
-        file_handler = features.get_file_handler() if features else None
-
-        if file_handler:
-            # Use enhanced file handler
-            try:
-                processed_file = await file_handler.handle_document_upload(
-                    document,
-                    user_id,
-                    update.message.caption or "Please review this file:",
-                )
-                prompt = processed_file.prompt
-
-                # Update progress message with file type info
-                await progress_msg.edit_text(
-                    f"📄 Processing {processed_file.type} file: `{document.file_name}`...",
-                    parse_mode="Markdown",
-                )
-
-            except Exception as e:
-                logger.warning(
-                    "Enhanced file handler failed, falling back to basic handler",
-                    error=str(e),
-                )
-                file_handler = None  # Fall back to basic handling
-
-        if not file_handler:
-            # Fall back to basic file handling
-            file = await document.get_file()
-            file_bytes = await file.download_as_bytearray()
-
-            # Try to decode as text
-            try:
-                content = file_bytes.decode("utf-8")
-
-                # Check content length
-                max_content_length = 50000  # 50KB of text
-                if len(content) > max_content_length:
-                    content = (
-                        content[:max_content_length]
-                        + "\n... (file truncated for processing)"
-                    )
-
-                # Create prompt with file content
-                caption = update.message.caption or "Please review this file:"
-                prompt = f"{caption}\n\n**File:** `{document.file_name}`\n\n```\n{content}\n```"
-
-            except UnicodeDecodeError:
-                await progress_msg.edit_text(
-                    "❌ **File Format Not Supported**\n\n"
-                    "File must be text-based and UTF-8 encoded.\n\n"
-                    "**Supported formats:**\n"
-                    "• Source code files (.py, .js, .ts, etc.)\n"
-                    "• Text files (.txt, .md)\n"
-                    "• Configuration files (.json, .yaml, .toml)\n"
-                    "• Documentation files"
+                    f"❌ **File Too Large**\n\n"
+                    f"Maximum file size: {max_size // 1024 // 1024}MB\n"
+                    f"Your file: {document.file_size / 1024 / 1024:.1f}MB"
                 )
                 return
 
-        # Delete progress message
-        await progress_msg.delete()
+            # Check rate limit for file processing
+            file_cost = _estimate_file_processing_cost(document.file_size)
+            if rate_limiter:
+                allowed, limit_message = await rate_limiter.check_rate_limit(
+                    user_id, file_cost
+                )
+                if not allowed:
+                    await update.message.reply_text(f"⏱️ {limit_message}")
+                    return
 
-        # Create a new progress message for Claude processing
-        claude_progress_msg = await update.message.reply_text(
-            "🤖 Processing file with Claude...", parse_mode="Markdown"
-        )
+            # Send processing indicator
+            await update.message.chat.send_action("upload_document")
 
-        # Get Claude integration from context
-        claude_integration = context.bot_data.get("claude_integration")
-
-        if not claude_integration:
-            await claude_progress_msg.edit_text(
-                "❌ **Claude integration not available**\n\n"
-                "The Claude Code integration is not properly configured.",
+            progress_msg = await update.message.reply_text(
+                f"📄 Processing file: `{document.file_name}`...",
                 parse_mode="Markdown",
             )
-            return
 
-        # Get current directory and session
-        current_dir = context.user_data.get(
-            "current_directory", settings.approved_directory
-        )
-        session_id = context.user_data.get("claude_session_id")
+            # Check if enhanced file handler is available
+            features = context.bot_data.get("features")
+            file_handler = features.get_file_handler() if features else None
+            prompt = ""
 
-        # Process with Claude
-        try:
-            claude_response = await claude_integration.run_command(
-                prompt=prompt,
-                working_directory=current_dir,
-                user_id=user_id,
-                session_id=session_id,
-            )
+            if file_handler:
+                # Use enhanced file handler
+                try:
+                    processed_file = await file_handler.handle_document_upload(
+                        document,
+                        user_id,
+                        update.message.caption or "Please review this file:",
+                    )
+                    prompt = processed_file.prompt
 
-            # Update session ID
-            context.user_data["claude_session_id"] = claude_response.session_id
+                    # Update progress message with file type info
+                    await progress_msg.edit_text(
+                        f"📄 Processing {processed_file.type} file: `{document.file_name}`...",
+                        parse_mode="Markdown",
+                    )
 
-            # Check if Claude changed the working directory and update our tracking
-            _update_working_directory_from_claude_response(
-                claude_response, context, settings, user_id
-            )
+                except Exception as handler_error:
+                    logger.warning(
+                        "Enhanced file handler failed, falling back to basic handler",
+                        error=str(handler_error),
+                    )
+                    file_handler = None  # Fall back to basic handling
 
-            # Format and send response
-            from ..utils.formatting import ResponseFormatter
+            if not file_handler:
+                # Fall back to basic file handling
+                file = await document.get_file()
+                file_bytes = await file.download_as_bytearray()
 
-            formatter = ResponseFormatter(settings)
-            formatted_messages = formatter.format_claude_response(
-                claude_response.content
-            )
+                # Try to decode as text
+                try:
+                    content = file_bytes.decode("utf-8")
 
-            # Delete progress message
-            await claude_progress_msg.delete()
+                    # Check content length
+                    max_content_length = 50000  # 50KB of text
+                    if len(content) > max_content_length:
+                        content = (
+                            content[:max_content_length]
+                            + "\n... (file truncated for processing)"
+                        )
 
-            # Send responses
-            for i, message in enumerate(formatted_messages):
-                await update.message.reply_text(
-                    message.text,
-                    parse_mode=message.parse_mode,
-                    reply_markup=message.reply_markup,
-                    reply_to_message_id=(update.message.message_id if i == 0 else None),
-                )
+                    # Create prompt with file content
+                    caption = update.message.caption or "Please review this file:"
+                    prompt = (
+                        f"{caption}\n\n**File:** `{document.file_name}`\n\n```\n"
+                        f"{content}\n```"
+                    )
 
-                if i < len(formatted_messages) - 1:
-                    await asyncio.sleep(0.5)
-
-        except Exception as e:
-            await claude_progress_msg.edit_text(
-                _format_error_message(str(e)), parse_mode="Markdown"
-            )
-            logger.exception(
-                "Claude file processing failed", error=str(e), user_id=user_id
-            )
-
-        # Log successful file processing
-        if audit_logger:
-            await audit_logger.log_file_access(
-                user_id=user_id,
-                file_path=document.file_name,
-                action="upload_processed",
-                success=True,
-                file_size=document.file_size,
-            )
-
-    except Exception as e:
-        try:
-            await progress_msg.delete()
-        except:
-            pass
-
-        error_msg = f"❌ **Error processing file**\n\n{str(e)}"
-        await update.message.reply_text(error_msg, parse_mode="Markdown")
-
-        # Log failed file processing
-        if audit_logger:
-            await audit_logger.log_file_access(
-                user_id=user_id,
-                file_path=document.file_name,
-                action="upload_failed",
-                success=False,
-                file_size=document.file_size,
-            )
-
-        logger.exception("Error processing document", error=str(e), user_id=user_id)
-
-
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle photo uploads."""
-    user_id = update.effective_user.id
-    settings: Settings = context.bot_data["settings"]
-
-    # Check if enhanced image handler is available
-    features = context.bot_data.get("features")
-    image_handler = features.get_image_handler() if features else None
-
-    if image_handler:
-        try:
-            # Send processing indicator
-            progress_msg = await update.message.reply_text(
-                "📸 Processing image...", parse_mode="Markdown"
-            )
-
-            # Get the largest photo size
-            photo = update.message.photo[-1]
-
-            # Process image with enhanced handler
-            processed_image = await image_handler.process_image(
-                photo, update.message.caption
-            )
+                except UnicodeDecodeError:
+                    await progress_msg.edit_text(
+                        "❌ **File Format Not Supported**\n\n"
+                        "File must be text-based and UTF-8 encoded.\n\n"
+                        "**Supported formats:**\n"
+                        "• Source code files (.py, .js, .ts, etc.)\n"
+                        "• Text files (.txt, .md)\n"
+                        "• Configuration files (.json, .yaml, .toml)\n"
+                        "• Documentation files"
+                    )
+                    return
 
             # Delete progress message
             await progress_msg.delete()
 
-            # Create Claude progress message
+            # Create a new progress message for Claude processing
             claude_progress_msg = await update.message.reply_text(
-                "🤖 Analyzing image with Claude...", parse_mode="Markdown"
+                "🤖 Processing file with Claude...", parse_mode="Markdown"
             )
 
-            # Get Claude integration
+            # Get Claude integration from context
             claude_integration = context.bot_data.get("claude_integration")
 
             if not claude_integration:
@@ -646,7 +662,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             # Process with Claude
             try:
                 claude_response = await claude_integration.run_command(
-                    prompt=processed_image.prompt,
+                    prompt=prompt,
                     working_directory=current_dir,
                     user_id=user_id,
                     session_id=session_id,
@@ -654,6 +670,12 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
                 # Update session ID
                 context.user_data["claude_session_id"] = claude_response.session_id
+
+                # Check if Claude changed the working directory and update our
+                # tracking
+                _update_working_directory_from_claude_response(
+                    claude_response, context, settings, user_id
+                )
 
                 # Format and send response
                 from ..utils.formatting import ResponseFormatter
@@ -680,19 +702,187 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                     if i < len(formatted_messages) - 1:
                         await asyncio.sleep(0.5)
 
-            except Exception as e:
+            except Exception as claude_error:
                 await claude_progress_msg.edit_text(
-                    _format_error_message(str(e)), parse_mode="Markdown"
+                    _format_error_message(str(claude_error)),
+                    parse_mode="Markdown",
                 )
                 logger.exception(
-                    "Claude image processing failed", error=str(e), user_id=user_id
+                    "Claude file processing failed",
+                    error=str(claude_error),
+                    user_id=user_id,
+                )
+
+            # Log successful file processing
+            if audit_logger:
+                await audit_logger.log_file_access(
+                    user_id=user_id,
+                    file_path=document.file_name,
+                    action="upload_processed",
+                    success=True,
+                    file_size=document.file_size,
                 )
 
         except Exception as e:
-            logger.exception("Image processing failed", error=str(e), user_id=user_id)
-            await update.message.reply_text(
-                f"❌ **Error processing image**\n\n{str(e)}", parse_mode="Markdown"
-            )
+            # Attempt to clean up progress messages
+            try:
+                if progress_msg is not None:
+                    await progress_msg.delete()
+                if claude_progress_msg is not None:
+                    await claude_progress_msg.delete()
+            except Exception:
+                logger.warning(
+                    "Failed to delete progress messages during error handling",
+                    user_id=user_id,
+                )
+
+            if span.is_recording():
+                span.record_exception(e)
+                span.set_status(Status(StatusCode.ERROR, str(e)))
+
+            error_msg = f"❌ **Error processing file**\n\n{str(e)}"
+            await update.message.reply_text(error_msg, parse_mode="Markdown")
+
+            # Log failed file processing
+            if audit_logger:
+                await audit_logger.log_file_access(
+                    user_id=user_id,
+                    file_path=document.file_name,
+                    action="upload_failed",
+                    success=False,
+                    file_size=document.file_size,
+                )
+
+            logger.exception("Error processing document", error=str(e), user_id=user_id)
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle photo uploads."""
+    user_id = update.effective_user.id
+    settings: Settings = context.bot_data["settings"]
+
+    # Check if enhanced image handler is available
+    features = context.bot_data.get("features")
+    image_handler = features.get_image_handler() if features else None
+
+    if image_handler:
+        with tracer.start_as_current_span("telegram.handle_photo") as span:
+            span.set_attribute("telegram.user_id", user_id)
+            if update.effective_chat:
+                span.set_attribute("telegram.chat_id", update.effective_chat.id)
+            has_caption = bool(update.message.caption if update.message else "")
+            span.set_attribute("telegram.has_caption", has_caption)
+
+            progress_msg = None
+            claude_progress_msg = None
+
+            try:
+                # Send processing indicator
+                progress_msg = await update.message.reply_text(
+                    "📸 Processing image...", parse_mode="Markdown"
+                )
+
+                # Get the largest photo size
+                photo = update.message.photo[-1]
+
+                # Process image with enhanced handler
+                processed_image = await image_handler.process_image(
+                    photo, update.message.caption
+                )
+
+                # Delete progress message
+                await progress_msg.delete()
+
+                # Create Claude progress message
+                claude_progress_msg = await update.message.reply_text(
+                    "🤖 Analyzing image with Claude...", parse_mode="Markdown"
+                )
+
+                # Get Claude integration
+                claude_integration = context.bot_data.get("claude_integration")
+
+                if not claude_integration:
+                    await claude_progress_msg.edit_text(
+                        "❌ **Claude integration not available**\n\n"
+                        "The Claude Code integration is not properly configured.",
+                        parse_mode="Markdown",
+                    )
+                    return
+
+                # Get current directory and session
+                current_dir = context.user_data.get(
+                    "current_directory", settings.approved_directory
+                )
+                session_id = context.user_data.get("claude_session_id")
+
+                # Process with Claude
+                try:
+                    claude_response = await claude_integration.run_command(
+                        prompt=processed_image.prompt,
+                        working_directory=current_dir,
+                        user_id=user_id,
+                        session_id=session_id,
+                    )
+
+                    # Update session ID
+                    context.user_data["claude_session_id"] = claude_response.session_id
+
+                    # Format and send response
+                    from ..utils.formatting import ResponseFormatter
+
+                    formatter = ResponseFormatter(settings)
+                    formatted_messages = formatter.format_claude_response(
+                        claude_response.content
+                    )
+
+                    # Delete progress message
+                    await claude_progress_msg.delete()
+
+                    # Send responses
+                    for i, message in enumerate(formatted_messages):
+                        await update.message.reply_text(
+                            message.text,
+                            parse_mode=message.parse_mode,
+                            reply_markup=message.reply_markup,
+                            reply_to_message_id=(
+                                update.message.message_id if i == 0 else None
+                            ),
+                        )
+
+                        if i < len(formatted_messages) - 1:
+                            await asyncio.sleep(0.5)
+
+                except Exception as claude_error:
+                    await claude_progress_msg.edit_text(
+                        _format_error_message(str(claude_error)),
+                        parse_mode="Markdown",
+                    )
+                    logger.exception(
+                        "Claude image processing failed",
+                        error=str(claude_error),
+                        user_id=user_id,
+                    )
+
+            except Exception as e:
+                try:
+                    if progress_msg is not None:
+                        await progress_msg.delete()
+                    if claude_progress_msg is not None:
+                        await claude_progress_msg.delete()
+                except Exception:
+                    logger.warning(
+                        "Failed to delete image progress messages during error handling",
+                        user_id=user_id,
+                    )
+
+                if span.is_recording():
+                    span.record_exception(e)
+                    span.set_status(Status(StatusCode.ERROR, str(e)))
+
+                await update.message.reply_text(
+                    f"❌ **Error processing image**\n\n{str(e)}", parse_mode="Markdown"
+                )
+
     else:
         # Fall back to unsupported message
         await update.message.reply_text(

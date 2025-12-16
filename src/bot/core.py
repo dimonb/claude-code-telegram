@@ -11,6 +11,7 @@ import asyncio
 from typing import Any, Callable, Dict, Optional
 
 import structlog
+from opentelemetry import trace
 from telegram import BotCommand, Update
 from telegram.ext import (
     Application,
@@ -26,6 +27,7 @@ from ..exceptions import ClaudeCodeTelegramError
 from .features.registry import FeatureRegistry
 
 logger = structlog.get_logger()
+tracer = trace.get_tracer("telegram.bot")
 
 
 class ClaudeCodeBot:
@@ -162,7 +164,31 @@ class ClaudeCodeBot:
             # Add settings
             context.bot_data["settings"] = self.settings
 
-            return await handler(update, context)
+            with tracer.start_as_current_span("telegram.update") as span:
+                if span.is_recording():
+                    event_type = type(update).__name__
+                    span.set_attribute("telegram.event_type", event_type)
+
+                    if update.effective_user:
+                        span.set_attribute("telegram.user_id", update.effective_user.id)
+                        if update.effective_user.username:
+                            span.set_attribute(
+                                "telegram.username", update.effective_user.username
+                            )
+
+                    if update.effective_chat:
+                        span.set_attribute("telegram.chat_id", update.effective_chat.id)
+                        span.set_attribute(
+                            "telegram.chat_type", update.effective_chat.type
+                        )
+
+                    msg = update.effective_message
+                    if msg and msg.text:
+                        text = msg.text
+                        span.set_attribute("telegram.message_length", len(text))
+                        span.set_attribute("telegram.message_text", text[:100])
+
+                return await handler(update, context)
 
         return wrapped
 
@@ -210,11 +236,9 @@ class ClaudeCodeBot:
                 context.bot_data[key] = value
             context.bot_data["settings"] = self.settings
 
-            # Create a dummy handler that does nothing (middleware will handle everything)
             async def dummy_handler(event, data):
                 return None
 
-            # Call middleware with Telegram-style parameters
             return await middleware_func(dummy_handler, update, context.bot_data)
 
         return middleware_wrapper

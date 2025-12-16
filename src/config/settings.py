@@ -137,6 +137,22 @@ class Settings(BaseSettings):
     # Monitoring
     log_level: str = Field("INFO", description="Logging level")
     enable_telemetry: bool = Field(False, description="Enable anonymous telemetry")
+    telemetry_enabled: bool = Field(
+        False,
+        description="Enable OpenTelemetry/Uptrace telemetry",
+    )
+    telemetry_service_name: str = Field(
+        "claude-code-telegram",
+        description="Service name for telemetry/tracing",
+    )
+    telemetry_json_log: bool = Field(
+        True,
+        description="Enable JSON structured logs when telemetry is enabled",
+    )
+    telemetry_log_level: str = Field(
+        "INFO",
+        description="Base log level for telemetry logging pipeline",
+    )
     sentry_dsn: Optional[str] = Field(None, description="Sentry DSN for error tracking")
 
     # Development

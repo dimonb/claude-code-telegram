@@ -153,6 +153,7 @@ This document provides a complete implementation roadmap for building a Telegram
 ### Recently Completed ✅
 - **Claude Code Integration**: Subprocess management, session handling, output parsing, tool monitoring
 - **Storage Layer**: SQLite database, repositories, analytics, persistent sessions (TODO-6)
+- **Telemetry Integration**: OpenTelemetry/Uptrace wiring, structured JSON logging, spans for Telegram handlers and Claude execution
 
 ### Next Steps ⏳
 - Add advanced features (TODO-7)

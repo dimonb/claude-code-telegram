@@ -1,6 +1,7 @@
 """Command handlers for bot operations."""
 
 import structlog
+from opentelemetry import trace
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
@@ -10,8 +11,10 @@ from ...security.audit import AuditLogger
 from ...security.validators import SecurityValidator
 
 logger = structlog.get_logger()
+tracer = trace.get_tracer(__name__)
 
 
+@tracer.start_as_current_span("command.start")
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /start command."""
     user = update.effective_user
@@ -63,6 +66,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
 
 
+@tracer.start_as_current_span("command.help")
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /help command."""
     help_text = (
@@ -105,6 +109,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(help_text, parse_mode="Markdown")
 
 
+@tracer.start_as_current_span("command.new_session")
 async def new_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /new command."""
     settings: Settings = context.bot_data["settings"]
@@ -149,6 +154,7 @@ async def new_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 
+@tracer.start_as_current_span("command.continue_session")
 async def continue_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /continue command with optional prompt."""
     user_id = update.effective_user.id
@@ -292,6 +298,7 @@ async def continue_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             )
 
 
+@tracer.start_as_current_span("command.list_files")
 async def list_files(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /ls command."""
     user_id = update.effective_user.id
@@ -321,9 +328,7 @@ async def list_files(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 try:
                     size = item.stat().st_size
                     size_str = _format_file_size(size)
-                    files.append(
-                        f"📄 {_escape_markdown(item.name)} ({size_str})"
-                    )
+                    files.append(f"📄 {_escape_markdown(item.name)} ({size_str})")
                 except OSError:
                     files.append(f"📄 {_escape_markdown(item.name)}")
 
@@ -386,6 +391,7 @@ async def list_files(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         logger.exception("Error in list_files command", error=str(e), user_id=user_id)
 
 
+@tracer.start_as_current_span("command.change_directory")
 async def change_directory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /cd command."""
     user_id = update.effective_user.id
@@ -489,6 +495,7 @@ async def change_directory(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
 
 
+@tracer.start_as_current_span("command.pwd")
 async def print_working_directory(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -519,6 +526,7 @@ async def print_working_directory(
     )
 
 
+@tracer.start_as_current_span("command.show_projects")
 async def show_projects(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /projects command."""
     settings: Settings = context.bot_data["settings"]
@@ -579,6 +587,7 @@ async def show_projects(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         logger.exception("Error in show_projects command", error=str(e))
 
 
+@tracer.start_as_current_span("command.status")
 async def session_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /status command."""
     user_id = update.effective_user.id
@@ -653,6 +662,7 @@ async def session_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
 
+@tracer.start_as_current_span("command.export_session")
 async def export_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /export command."""
     user_id = update.effective_user.id
@@ -709,6 +719,7 @@ async def export_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
 
+@tracer.start_as_current_span("command.end_session")
 async def end_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /end command to terminate the current session."""
     user_id = update.effective_user.id
@@ -772,6 +783,7 @@ async def end_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     logger.info("Session ended by user", user_id=user_id, session_id=claude_session_id)
 
 
+@tracer.start_as_current_span("command.quick_actions")
 async def quick_actions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /actions command to show quick actions."""
     user_id = update.effective_user.id
@@ -834,6 +846,7 @@ async def quick_actions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
 
 
+@tracer.start_as_current_span("command.git")
 async def git_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /git command to show git repository information."""
     user_id = update.effective_user.id

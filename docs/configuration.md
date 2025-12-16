@@ -124,8 +124,18 @@ ENABLE_QUICK_ACTIONS=true
 # Log level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
 LOG_LEVEL=INFO
 
-# Enable anonymous telemetry
+# Enable anonymous usage telemetry
 ENABLE_TELEMETRY=false
+
+# OpenTelemetry / Uptrace integration
+TELEMETRY_ENABLED=false
+TELEMETRY_SERVICE_NAME=claude-code-telegram
+TELEMETRY_JSON_LOG=true
+TELEMETRY_LOG_LEVEL=INFO
+
+# Standard OTEL exporter configuration (example for Uptrace)
+OTEL_EXPORTER_OTLP_ENDPOINT=http://uptrace:4317
+OTEL_EXPORTER_OTLP_HEADERS="uptrace-dsn=YOUR_UPTRACE_DSN"
 
 # Sentry DSN for error tracking
 SENTRY_DSN=https://your-sentry-dsn@sentry.io/project

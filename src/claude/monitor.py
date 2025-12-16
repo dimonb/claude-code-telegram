@@ -11,11 +11,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import structlog
+from opentelemetry import trace
 
 from ..config.settings import Settings
 from ..security.validators import SecurityValidator
 
 logger = structlog.get_logger()
+tracer = trace.get_tracer("claude.monitor")
 
 
 class ToolMonitor:
@@ -30,6 +32,7 @@ class ToolMonitor:
         self.tool_usage: Dict[str, int] = defaultdict(int)
         self.security_violations: List[Dict[str, Any]] = []
 
+    @tracer.start_as_current_span("claude.tool.validate")
     async def validate_tool_call(
         self,
         tool_name: str,
@@ -38,6 +41,11 @@ class ToolMonitor:
         user_id: int,
     ) -> Tuple[bool, Optional[str]]:
         """Validate tool call before execution."""
+        span = trace.get_current_span()
+        span.set_attribute("tool.name", tool_name)
+        span.set_attribute("user_id", user_id)
+        span.set_attribute("working_directory", str(working_directory))
+
         logger.debug(
             "Validating tool call",
             tool_name=tool_name,
@@ -58,6 +66,8 @@ class ToolMonitor:
                     "working_directory": str(working_directory),
                 }
                 self.security_violations.append(violation)
+                span.set_attribute("tool.validated", False)
+                span.set_attribute("tool.error", "disallowed_tool")
                 logger.warning("Tool not allowed", **violation)
                 return False, f"Tool not allowed: {tool_name}"
 
@@ -74,6 +84,8 @@ class ToolMonitor:
                     "working_directory": str(working_directory),
                 }
                 self.security_violations.append(violation)
+                span.set_attribute("tool.validated", False)
+                span.set_attribute("tool.error", "explicitly_disallowed")
                 logger.warning("Tool explicitly disallowed", **violation)
                 return False, f"Tool explicitly disallowed: {tool_name}"
 
@@ -88,6 +100,8 @@ class ToolMonitor:
         ]:
             file_path = tool_input.get("path") or tool_input.get("file_path")
             if not file_path:
+                span.set_attribute("tool.validated", False)
+                span.set_attribute("tool.error", "file_path_required")
                 return False, "File path required"
 
             # Validate path security
@@ -106,6 +120,8 @@ class ToolMonitor:
                         "error": error,
                     }
                     self.security_violations.append(violation)
+                    span.set_attribute("tool.validated", False)
+                    span.set_attribute("tool.error", "invalid_file_path")
                     logger.warning("Invalid file path in tool call", **violation)
                     return False, error
 
@@ -142,12 +158,15 @@ class ToolMonitor:
                         "working_directory": str(working_directory),
                     }
                     self.security_violations.append(violation)
+                    span.set_attribute("tool.validated", False)
+                    span.set_attribute("tool.error", "dangerous_command")
                     logger.warning("Dangerous command detected", **violation)
                     return False, f"Dangerous command pattern detected: {pattern}"
 
         # Track usage
         self.tool_usage[tool_name] += 1
 
+        span.set_attribute("tool.validated", True)
         logger.debug("Tool call validated successfully", tool_name=tool_name)
         return True, None
 

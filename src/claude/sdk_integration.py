@@ -15,6 +15,9 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional
 
 import structlog
+from opentelemetry import trace
+from opentelemetry.trace import Status, StatusCode
+import claude_code_sdk
 from claude_code_sdk import (
     ClaudeCodeOptions,
     ClaudeSDKError,
@@ -22,7 +25,6 @@ from claude_code_sdk import (
     CLINotFoundError,
     Message,
     ProcessError,
-    query,
 )
 from claude_code_sdk.types import (
     AssistantMessage,
@@ -41,6 +43,7 @@ from .exceptions import (
 )
 
 logger = structlog.get_logger()
+tracer = trace.get_tracer("claude.sdk")
 
 
 def find_claude_cli(claude_cli_path: Optional[str] = None) -> Optional[str]:
@@ -208,22 +211,22 @@ class ClaudeSDKManager:
             # Update session
             self._update_session(final_session_id, messages)
 
+            # Extract content for attributes
+            content = self._extract_content_from_messages(messages)
+            num_turns = len(
+                [m for m in messages if isinstance(m, (UserMessage, AssistantMessage))]
+            )
+
             return ClaudeResponse(
-                content=self._extract_content_from_messages(messages),
+                content=content,
                 session_id=final_session_id,
                 cost=cost,
                 duration_ms=duration_ms,
-                num_turns=len(
-                    [
-                        m
-                        for m in messages
-                        if isinstance(m, (UserMessage, AssistantMessage))
-                    ]
-                ),
+                num_turns=num_turns,
                 tools_used=tools_used,
             )
 
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as e:
             logger.exception(
                 "Claude SDK command timed out",
             )
@@ -244,19 +247,93 @@ class ClaudeSDKManager:
             raise ClaudeProcessError(error_msg)
 
         except ProcessError as e:
+            error_str = str(e)
+
+            # Check for usage limit error
+            if (
+                "limit reached" in error_str.lower()
+                or "usage limit" in error_str.lower()
+            ):
+                import re
+
+                time_match = re.search(
+                    r"resets?\s*(\d+[apm]+)", error_str, re.IGNORECASE
+                )
+                timezone_match = re.search(r"\(([^)]+)\)", error_str)
+
+                reset_time = time_match.group(1) if time_match else "later"
+                timezone = timezone_match.group(1) if timezone_match else ""
+
+                logger.warning(
+                    "Claude usage limit reached",
+                    reset_time=reset_time,
+                    timezone=timezone,
+                )
+
+                user_friendly_msg = (
+                    f"⏱️ **Claude AI Usage Limit Reached**\n\n"
+                    f"You've reached your Claude AI usage limit for this period.\n\n"
+                    f"**When will it reset?**\n"
+                    f"Your limit will reset at **{reset_time}**"
+                    f"{f' ({timezone})' if timezone else ''}\n\n"
+                    f"**What you can do:**\n"
+                    f"• Wait for the limit to reset automatically\n"
+                    f"• Try again after the reset time\n"
+                    f"• Use simpler requests that require less processing\n"
+                    f"• Contact support if you need a higher limit"
+                )
+                raise ClaudeProcessError(user_friendly_msg)
+
             logger.exception(
                 "Claude process failed",
                 exit_code=getattr(e, "exit_code", None),
             )
-            raise ClaudeProcessError(f"Claude process error: {str(e)}")
+            raise ClaudeProcessError(f"Claude process error: {error_str}")
 
         except CLIConnectionError as e:
             logger.exception("Claude connection error", error=str(e))
             raise ClaudeProcessError(f"Failed to connect to Claude: {str(e)}")
 
         except ClaudeSDKError as e:
-            logger.exception("Claude SDK error", error=str(e))
-            raise ClaudeProcessError(f"Claude SDK error: {str(e)}")
+            error_str = str(e)
+
+            # Check for usage limit error
+            if (
+                "limit reached" in error_str.lower()
+                or "usage limit" in error_str.lower()
+            ):
+                import re
+
+                time_match = re.search(
+                    r"resets?\s*(\d+[apm]+)", error_str, re.IGNORECASE
+                )
+                timezone_match = re.search(r"\(([^)]+)\)", error_str)
+
+                reset_time = time_match.group(1) if time_match else "later"
+                timezone = timezone_match.group(1) if timezone_match else ""
+
+                logger.warning(
+                    "Claude usage limit reached",
+                    reset_time=reset_time,
+                    timezone=timezone,
+                )
+
+                user_friendly_msg = (
+                    f"⏱️ **Claude AI Usage Limit Reached**\n\n"
+                    f"You've reached your Claude AI usage limit for this period.\n\n"
+                    f"**When will it reset?**\n"
+                    f"Your limit will reset at **{reset_time}**"
+                    f"{f' ({timezone})' if timezone else ''}\n\n"
+                    f"**What you can do:**\n"
+                    f"• Wait for the limit to reset automatically\n"
+                    f"• Try again after the reset time\n"
+                    f"• Use simpler requests that require less processing\n"
+                    f"• Contact support if you need a higher limit"
+                )
+                raise ClaudeProcessError(user_friendly_msg)
+
+            logger.exception("Claude SDK error", error=error_str)
+            raise ClaudeProcessError(f"Claude SDK error: {error_str}")
 
         except Exception as e:
             # Handle ExceptionGroup from TaskGroup operations (Python 3.11+)
@@ -292,9 +369,27 @@ class ClaudeSDKManager:
         self, prompt: str, options, messages: List, stream_callback: Optional[Callable]
     ) -> None:
         """Execute query with streaming and collect messages."""
+        message_count = 0
+        tool_count = 0
+        text_blocks_count = 0
+        assistant_messages_count = 0
+
         try:
-            async for message in query(prompt=prompt, options=options):
+            # Use claude_code_sdk.query directly to allow instrumentation patching
+            async for message in claude_code_sdk.query(prompt=prompt, options=options):
                 messages.append(message)
+                message_count += 1
+
+                # Track message types
+                if isinstance(message, AssistantMessage):
+                    assistant_messages_count += 1
+                    content = getattr(message, "content", [])
+                    if content and isinstance(content, list):
+                        for block in content:
+                            if isinstance(block, TextBlock):
+                                text_blocks_count += 1
+                            elif isinstance(block, ToolUseBlock):
+                                tool_count += 1
 
                 # Handle streaming callback
                 if stream_callback:
@@ -306,19 +401,12 @@ class ClaudeSDKManager:
                             error=str(callback_error),
                             error_type=type(callback_error).__name__,
                         )
-                        # Continue processing even if callback fails
 
         except Exception as e:
-            # Handle both ExceptionGroups and regular exceptions
             if type(e).__name__ == "ExceptionGroup" or hasattr(e, "exceptions"):
-                logger.exception(
-                    "TaskGroup error in streaming execution",
-                )
+                logger.exception("TaskGroup error in streaming execution")
             else:
-                logger.exception(
-                    "Error in streaming execution",
-                )
-            # Re-raise to be handled by the outer try-catch
+                logger.exception("Error in streaming execution")
             raise
 
     async def _handle_stream_message(

@@ -302,13 +302,21 @@ DEBUG=true
 make run-debug
 ```
 
-#### Monitor usage and costs
+#### Monitor usage, costs and traces
 ```bash
 # Check usage in Telegram
 /status
 
 # Monitor logs for cost tracking
 tail -f logs/bot.log | grep -i cost
+
+# Enable OpenTelemetry/Uptrace integration
+TELEMETRY_ENABLED=true
+TELEMETRY_SERVICE_NAME=claude-code-telegram
+
+# Point OTEL exporter to Uptrace
+OTEL_EXPORTER_OTLP_ENDPOINT=http://uptrace:4317
+OTEL_EXPORTER_OTLP_HEADERS="uptrace-dsn=YOUR_UPTRACE_DSN"
 ```
 
 ## Production Deployment
