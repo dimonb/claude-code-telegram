@@ -239,15 +239,21 @@ async def handle_text_message(
                 try:
                     # Check for usage limit in stream content
                     # Handle both string and list content types
-                    content_str = (
-                        update_obj.content
-                        if isinstance(update_obj.content, str)
-                        else (
-                            " ".join(update_obj.content)
-                            if isinstance(update_obj.content, list)
-                            else str(update_obj.content)
-                        )
-                    )
+                    if isinstance(update_obj.content, str):
+                        content_str = update_obj.content
+                    elif isinstance(update_obj.content, list):
+                        # Handle list of strings or TextBlock objects
+                        content_parts = []
+                        for item in update_obj.content:
+                            if isinstance(item, str):
+                                content_parts.append(item)
+                            elif hasattr(item, "text"):
+                                content_parts.append(item.text)
+                            else:
+                                content_parts.append(str(item))
+                        content_str = " ".join(content_parts)
+                    else:
+                        content_str = str(update_obj.content)
                     if content_str and "limit reached" in content_str.lower():
                         import re
 
@@ -286,7 +292,7 @@ async def handle_text_message(
                         )
                         last_progress_text = progress_text
                 except Exception as stream_error:
-                    logger.warning(
+                    logger.exception(
                         "Failed to update progress message", error=str(stream_error)
                     )
 

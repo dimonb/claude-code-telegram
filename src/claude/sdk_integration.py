@@ -131,10 +131,35 @@ class ClaudeResponse:
 class StreamUpdate:
     """Streaming update from Claude SDK."""
 
-    type: str  # 'assistant', 'user', 'system', 'result'
+    type: str  # 'assistant', 'user', 'system', 'result', 'tool_result', 'error', 'progress'
     content: Optional[str] = None
     tool_calls: Optional[List[Dict]] = None
     metadata: Optional[Dict] = None
+    progress: Optional[Dict] = None
+
+    def is_error(self) -> bool:
+        """Check if this is an error update."""
+        return self.type == "error" or (
+            self.metadata and self.metadata.get("is_error", False)
+        )
+
+    def get_error_message(self) -> str:
+        """Get error message from update."""
+        if self.metadata and "error" in self.metadata:
+            return str(self.metadata["error"])
+        return self.content or "Unknown error"
+
+    def get_tool_names(self) -> List[str]:
+        """Get tool names from tool_calls."""
+        if not self.tool_calls:
+            return []
+        return [call.get("name", "unknown") for call in self.tool_calls]
+
+    def get_progress_percentage(self) -> Optional[int]:
+        """Get progress percentage if available."""
+        if self.progress:
+            return self.progress.get("percentage")
+        return None
 
 
 class ClaudeSDKManager:
@@ -179,6 +204,24 @@ class ClaudeSDKManager:
         )
 
         try:
+            # Check if we should continue an existing session
+            previous_messages = []
+            if continue_session and session_id and session_id in self.active_sessions:
+                session_data = self.active_sessions[session_id]
+                previous_messages = session_data.get("messages", [])
+                logger.info(
+                    "Continuing existing session",
+                    session_id=session_id,
+                    previous_message_count=len(previous_messages),
+                )
+            else:
+                logger.info(
+                    "Starting new session",
+                    session_id=session_id,
+                    continue_session=continue_session,
+                    has_active_session=session_id in self.active_sessions if session_id else False,
+                )
+
             # Create security hooks for this request
             security_hooks = SecurityHooks(
                 config=self.config,
@@ -198,15 +241,17 @@ class ClaudeSDKManager:
                 hooks=hooks_config,  # Security validation hooks
             )
 
-            # Collect messages
+            # Collect NEW messages from this query
+            # (previous messages are used for context but not duplicated in response)
             messages = []
             cost = 0.0
             tools_used = []
 
             # Execute with streaming and timeout
+            # Pass previous messages for context
             await asyncio.wait_for(
                 self._execute_query_with_streaming(
-                    prompt, options, messages, stream_callback
+                    prompt, options, messages, stream_callback, previous_messages
                 ),
                 timeout=self.config.claude_timeout_seconds,
             )
@@ -269,8 +314,15 @@ class ClaudeSDKManager:
             # Get or create session ID
             final_session_id = session_id or str(uuid.uuid4())
 
-            # Update session
-            self._update_session(final_session_id, messages)
+            # Update session with ALL messages (previous + new)
+            all_messages = previous_messages + messages if previous_messages else messages
+            self._update_session(final_session_id, all_messages)
+            logger.debug(
+                "Session updated",
+                session_id=final_session_id,
+                total_messages=len(all_messages),
+                new_messages=len(messages),
+            )
 
             # Extract content for attributes
             content = self._extract_content_from_messages(messages)
@@ -477,13 +529,49 @@ class ClaudeSDKManager:
                 raise ClaudeProcessError(f"Unexpected error: {str(e)}")
 
     async def _execute_query_with_streaming(
-        self, prompt: str, options, messages: List, stream_callback: Optional[Callable]
+        self, prompt: str, options, messages: List, stream_callback: Optional[Callable],
+        previous_messages: Optional[List] = None
     ) -> None:
-        """Execute query with streaming and collect messages."""
+        """Execute query with streaming and collect messages.
+
+        Args:
+            prompt: User's prompt
+            options: ClaudeAgentOptions
+            messages: List to collect response messages
+            stream_callback: Optional callback for streaming updates
+            previous_messages: Previous messages for session continuation
+        """
         message_count = 0
         tool_count = 0
         text_blocks_count = 0
         assistant_messages_count = 0
+
+        # Build conversation context if continuing session
+        if previous_messages:
+            logger.info(
+                "Building conversation context for continuation",
+                previous_message_count=len(previous_messages),
+            )
+            # Extract recent conversation summary for context
+            context_parts = []
+            # Get last few exchanges (user + assistant pairs)
+            recent_messages = previous_messages[-6:] if len(previous_messages) > 6 else previous_messages
+            for msg in recent_messages:
+                if isinstance(msg, UserMessage):
+                    content = getattr(msg, "content", "")
+                    if content:
+                        # Only include the actual text content
+                        if isinstance(content, str):
+                            context_parts.append(f"Previous user: {content[:200]}")
+                elif isinstance(msg, AssistantMessage):
+                    content = self._extract_content_from_messages([msg])
+                    if content:
+                        context_parts.append(f"Previous response: {content[:200]}")
+
+            if context_parts:
+                context_summary = "\n".join(context_parts)
+                prompt = f"[Previous conversation context]\n{context_summary}\n\n[Current request]\n{prompt}"
+                logger.debug("Added conversation context to prompt", context_length=len(context_summary))
 
         # Use ClaudeSDKClient for streaming
         try:
@@ -594,32 +682,80 @@ class ClaudeSDKManager:
                 if content and isinstance(content, list):
                     # Extract text from TextBlock objects
                     text_parts = []
+                    tool_calls = []
+
                     for block in content:
-                        if hasattr(block, "text"):
-                            text_parts.append(block.text)
+                        # Handle TextBlock
+                        if isinstance(block, TextBlock):
+                            text = getattr(block, "text", "")
+                            if text:
+                                text_parts.append(text)
+                        # Handle ToolUseBlock
+                        elif isinstance(block, ToolUseBlock):
+                            tool_name = getattr(block, "name", "unknown")
+                            tool_id = getattr(block, "id", None)
+                            tool_input = getattr(block, "input", {})
+                            tool_calls.append({
+                                "name": tool_name,
+                                "id": tool_id,
+                                "input": tool_input
+                            })
+
+                    # Send text content if available
                     if text_parts:
                         update = StreamUpdate(
                             type="assistant",
                             content="\n".join(text_parts),
                         )
                         await stream_callback(update)
+
+                    # Send tool calls if available
+                    if tool_calls:
+                        update = StreamUpdate(
+                            type="assistant",
+                            tool_calls=tool_calls,
+                        )
+                        await stream_callback(update)
+
                 elif content:
-                    # Fallback for non-list content
+                    # Fallback for other content types (e.g., single TextBlock)
+                    if isinstance(content, str):
+                        content_str = content
+                    elif hasattr(content, "text"):
+                        # Single TextBlock
+                        content_str = content.text
+                    else:
+                        content_str = str(content)
+
                     update = StreamUpdate(
                         type="assistant",
-                        content=str(content),
+                        content=content_str,
                     )
                     await stream_callback(update)
-
-                # Check for tool calls (if available in the message structure)
-                # Note: This depends on the actual claude-agent-sdk message structure
 
             elif isinstance(message, UserMessage):
                 content = getattr(message, "content", "")
                 if content:
+                    # Handle both string and list content types
+                    if isinstance(content, str):
+                        content_str = content
+                    elif isinstance(content, list):
+                        # Extract text from content blocks
+                        text_parts = []
+                        for block in content:
+                            if isinstance(block, TextBlock):
+                                text_parts.append(getattr(block, "text", ""))
+                            elif hasattr(block, "text"):
+                                text_parts.append(block.text)
+                            else:
+                                text_parts.append(str(block))
+                        content_str = "\n".join(text_parts)
+                    else:
+                        content_str = str(content)
+
                     update = StreamUpdate(
                         type="user",
-                        content=content,
+                        content=content_str,
                     )
                     await stream_callback(update)
 
@@ -634,10 +770,20 @@ class ClaudeSDKManager:
             if isinstance(message, AssistantMessage):
                 content = getattr(message, "content", [])
                 if content and isinstance(content, list):
-                    # Extract text from TextBlock objects
+                    # Extract text from TextBlock and ToolResultBlock objects
                     for block in content:
-                        if hasattr(block, "text"):
-                            content_parts.append(block.text)
+                        if isinstance(block, TextBlock):
+                            text = getattr(block, "text", "")
+                            if text:
+                                content_parts.append(text)
+                        elif isinstance(block, ToolResultBlock):
+                            # Include tool results in content
+                            result_content = getattr(block, "content", "")
+                            if result_content:
+                                if isinstance(result_content, str):
+                                    content_parts.append(result_content)
+                                else:
+                                    content_parts.append(str(result_content))
                 elif content:
                     # Fallback for non-list content
                     content_parts.append(str(content))
@@ -659,9 +805,9 @@ class ClaudeSDKManager:
                         if isinstance(block, ToolUseBlock):
                             tools_used.append(
                                 {
-                                    "name": getattr(block, "tool_name", "unknown"),
+                                    "name": getattr(block, "name", "unknown"),
                                     "timestamp": current_time,
-                                    "input": getattr(block, "tool_input", {}),
+                                    "input": getattr(block, "input", {}),
                                 }
                             )
 

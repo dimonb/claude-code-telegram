@@ -128,15 +128,16 @@ class SecurityHooks:
                 return self._deny(error_msg)
 
             # Check for dangerous command patterns
-            # Note: This is intentionally restrictive - adjust based on your security requirements
+            # Only block truly dangerous patterns that could harm the system
+            # Common tools like curl, wget, pipes are allowed for legitimate development work
             dangerous_patterns = [
-                "rm -rf",  # Recursive force delete
-                "sudo",  # Privilege escalation
-                "chmod 777",  # Overly permissive permissions
-                "curl",  # External network access
-                "wget",  # External network access
-                "nc ",  # Netcat - network tool
-                "netcat",  # Network tool
+                "sudo",  # Privilege escalation (per user request)
+                "rm -rf /",  # Recursive delete of root
+                "chmod 777 /",  # Overly permissive permissions on root
+                "mkfs",  # Format filesystem
+                "dd if=",  # Disk operations
+                "> /dev/sda",  # Write to disk device
+                ":(){ :|:& };:",  # Fork bomb
             ]
 
             command_lower = command.lower()
@@ -156,7 +157,13 @@ class SecurityHooks:
 
         # All checks passed - approve
         span.set_attribute("tool.validated", True)
-        logger.debug("Tool call validated successfully", tool_name=tool_name)
+        span.set_attribute("tool.approved", True)
+        logger.info(
+            "Tool call approved",
+            tool_name=tool_name,
+            tool_use_id=tool_use_id,
+            tool_input_size=len(str(tool_input)),
+        )
         return {}  # Empty dict means approve
 
     def _deny(self, reason: str) -> Dict[str, Any]:

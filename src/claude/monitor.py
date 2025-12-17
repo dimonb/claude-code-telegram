@@ -126,25 +126,18 @@ class ToolMonitor:
                     return False, error
 
         # Validate shell commands
+        # NOTE: This validation is secondary to SecurityHooks in the SDK
+        # Only block truly dangerous patterns, not common shell operators
         if tool_name in ["bash", "shell", "Bash"]:
             command = tool_input.get("command", "")
 
-            # Check for dangerous commands
+            # Check for truly dangerous commands only
+            # Common shell operators like >, |, ;, &, $() are allowed
             dangerous_patterns = [
-                "rm -rf",
-                "sudo",
-                "chmod 777",
-                "curl",
-                "wget",
-                "nc ",
-                "netcat",
-                ">",
-                ">>",
-                "|",
-                "&",
-                ";",
-                "$(",
-                "`",
+                "sudo",      # Privilege escalation (per user request)
+                "rm -rf /",  # Recursive delete of root
+                "chmod 777", # Overly permissive chmod
+                # Note: curl, wget, pipes, redirects are allowed for legitimate use
             ]
 
             for pattern in dangerous_patterns:

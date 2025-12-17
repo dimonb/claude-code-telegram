@@ -10,8 +10,11 @@ import functools
 import sys
 from typing import Any, AsyncIterator
 
+import structlog
 from opentelemetry import trace
 from opentelemetry.trace import Status, StatusCode
+
+logger = structlog.get_logger()
 
 
 class ClaudeSDKInstrumentor:
@@ -122,6 +125,11 @@ class ClaudeSDKInstrumentor:
                                             tool_name = getattr(
                                                 block, "name", "unknown"
                                             )
+                                            logger.debug(
+                                                "ToolUseBlock received",
+                                                tool_name=tool_name,
+                                                tool_id=tool_id,
+                                            )
                                             # Create a child span for each tool call
                                             # Keep it open until we get the result
                                             tool_span = tracer.start_span(
@@ -141,13 +149,28 @@ class ClaudeSDKInstrumentor:
                                                 )
                                                 # Store span to add result later
                                                 active_tool_spans[tool_id] = tool_span
+                                                logger.debug(
+                                                    "Tool span created and stored",
+                                                    tool_name=tool_name,
+                                                    tool_id=tool_id,
+                                                )
                                             else:
                                                 # No ID, can't match result - end immediately
+                                                logger.warning(
+                                                    "ToolUseBlock without ID",
+                                                    tool_name=tool_name,
+                                                )
                                                 tool_span.end()
                                         elif isinstance(block, ToolResultBlock):
                                             # Match result to tool span
                                             tool_use_id = getattr(
                                                 block, "tool_use_id", None
+                                            )
+                                            logger.debug(
+                                                "ToolResultBlock received",
+                                                tool_use_id=tool_use_id,
+                                                has_span=tool_use_id in active_tool_spans if tool_use_id else False,
+                                                active_spans_count=len(active_tool_spans),
                                             )
                                             if (
                                                 tool_use_id
@@ -162,9 +185,16 @@ class ClaudeSDKInstrumentor:
                                                     block, "is_error", False
                                                 )
                                                 if content:
+                                                    result_preview = str(content)[:100]
                                                     tool_span.set_attribute(
                                                         "tool_result",
                                                         str(content)[:1000],
+                                                    )
+                                                    logger.debug(
+                                                        "Tool result captured",
+                                                        tool_use_id=tool_use_id,
+                                                        result_length=len(str(content)),
+                                                        result_preview=result_preview,
                                                     )
                                                 tool_span.set_attribute(
                                                     "tool_is_error", bool(is_error)
@@ -178,6 +208,12 @@ class ClaudeSDKInstrumentor:
                                                     )
                                                 # End the tool span now that we have the result
                                                 tool_span.end()
+                                            else:
+                                                logger.warning(
+                                                    "ToolResultBlock without matching span",
+                                                    tool_use_id=tool_use_id,
+                                                    active_spans=list(active_tool_spans.keys()),
+                                                )
 
                             elif isinstance(message, ResultMessage):
                                 cost = getattr(message, "total_cost_usd", None)
