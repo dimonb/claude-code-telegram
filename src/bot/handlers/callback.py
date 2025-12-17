@@ -6,11 +6,13 @@ import structlog
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest
 from telegram.ext import ContextTypes
+from telegram.helpers import escape_markdown
 
 from ...claude.facade import ClaudeIntegration
 from ...config.settings import Settings
 from ...security.audit import AuditLogger
 from ...security.validators import SecurityValidator
+from .message import _format_tool_name, _format_tool_params
 
 logger = structlog.get_logger()
 
@@ -1371,12 +1373,19 @@ async def handle_project_command_callback(
             )
             return
 
-        # Show executing message
+        def _escape_mdv2(text: str) -> str:
+            """Escape MarkdownV2 using telegram helper."""
+            return escape_markdown(str(text), version=2)
+
+        # Show executing message (MarkdownV2)
+        escaped_command = _escape_mdv2(command_name)
+        escaped_dir = _escape_mdv2(str(relative_path))
+        start_line = _escape_mdv2("🔄 Starting...")
         progress_msg = await query.edit_message_text(
-            f"⏳ **Executing** `/{command_name}`\n\n"
-            f"📂 Directory: `{relative_path}/`\n\n"
-            f"🔄 Starting...",
-            parse_mode="Markdown",
+            f"⏳ Executing /{escaped_command}\n"
+            f"📂 {escaped_dir}/\n\n"
+            f"{start_line}",
+            parse_mode="MarkdownV2",
         )
 
         # Check if Claude integration is available
@@ -1396,53 +1405,202 @@ async def handle_project_command_callback(
 
         last_progress_text = ""
         last_update_time = 0.0
+        tool_journal: dict = {}
+        tool_order: list[str] = []
+        use_journal = claude_integration.get_agent_type() == "cursor-agent"
+        todos: dict[str, dict] = {}
+        thinking_frames = [".", "..", "..."]
+        thinking_index = 0
+
+        def _todo_icon(status: str) -> tuple[str, str]:
+            """Map todo status to icon and normalized state."""
+            st = (status or "").upper()
+            if "DONE" in st or "COMPLETE" in st:
+                return "✅", "done"
+            if "PROGRESS" in st or "DOING" in st:
+                return "🔄", "progress"
+            return "⬜️", "pending"
+
+        def _update_todos_from_update(update_obj):
+            """Update todos honoring merge flag (default True)."""
+            todo_list = None
+            merge_flag = True
+            metadata = update_obj.metadata or {}
+            if metadata.get("tool_name") == "updatetodos":
+                tool_args = metadata.get("tool_args", {})
+                todo_list = tool_args.get("todos")
+                if "merge" in tool_args:
+                    merge_flag = bool(tool_args.get("merge"))
+
+            if not todo_list and update_obj.tool_calls:
+                first_call = update_obj.tool_calls[0]
+                input_args = first_call.get("input", {})
+                todo_list = input_args.get("todos")
+                if "merge" in input_args:
+                    merge_flag = bool(input_args.get("merge"))
+
+            if not todo_list:
+                return
+
+            if not merge_flag:
+                todos.clear()
+
+            for item in todo_list:
+                tid = item.get("id") or item.get("content")
+                if not tid:
+                    continue
+                existing = todos.get(tid, {})
+                todos[tid] = {
+                    "content": item.get("content", existing.get("content", "")),
+                    "status": item.get("status", existing.get("status", "TODO_STATUS_PENDING")),
+                }
+
+        def _build_journal_text() -> str:
+            """Render a compact tool journal for the progress message."""
+            if not tool_journal or not tool_order:
+                return ""
+
+            lines = []
+            for call_id in tool_order:
+                entry = tool_journal.get(call_id)
+                if not entry:
+                    continue
+                tool_name = _format_tool_name(entry.get("name", "tool"))
+                params_str = _format_tool_params(entry.get("params", {}))
+                icon = entry.get("icon", "⏳")
+                status = entry.get("status")
+                status_suffix = f" [{status}]" if status else ""
+                lines.append(
+                    f"{icon} {_escape_mdv2(tool_name)}{_escape_mdv2(params_str)}{_escape_mdv2(status_suffix)}"
+                )
+
+            return "\n".join(lines)
+
+        def _build_todo_text() -> str:
+            """Render todos with strike-through for completed items."""
+            if not todos:
+                return ""
+
+            lines = ["📝 TODOs"]
+            for item in todos.values():
+                icon, state = _todo_icon(item.get("status"))
+                content = _escape_mdv2(item.get("content", ""))
+                if state == "done":
+                    content = f"~{content}~"
+                lines.append(f"\\- {icon} {content}")
+
+            return "\n".join(lines)
 
         async def stream_handler(update_obj):
-            nonlocal last_progress_text, last_update_time
+            nonlocal last_progress_text, last_update_time, thinking_index
             try:
                 current_time = time.time()
 
-                # Format progress based on update type
-                progress_text = None
+                # Track tool usage in journal when cursor-agent is active
+                if use_journal and update_obj.type in {"tool_call", "tool_result"}:
+                    metadata = update_obj.metadata or {}
+                    call_id = metadata.get("call_id") or metadata.get("tool_use_id")
+                    tool_name = metadata.get("tool_name", "tool")
 
+                    params = {}
+                    if update_obj.tool_calls and len(update_obj.tool_calls) > 0:
+                        tool_call = update_obj.tool_calls[0]
+                        tool_name = tool_call.get("name", tool_name)
+                        params = tool_call.get("input", {})
+                    if not params:
+                        params = metadata.get("tool_args", {})
+
+                    if update_obj.type == "tool_call" and call_id:
+                        tool_journal[call_id] = {
+                            "name": tool_name,
+                            "params": params,
+                            "status": "running",
+                            "icon": "⏳",
+                        }
+                        if call_id not in tool_order:
+                            tool_order.append(call_id)
+
+                    elif update_obj.type == "tool_result" and call_id:
+                        is_error = update_obj.is_error() or metadata.get("status") == "error"
+                        existing = tool_journal.get(call_id, {})
+                        if not params:
+                            params = existing.get("params", {})
+                        tool_journal[call_id] = {
+                            "name": existing.get("name", tool_name),
+                            "params": params,
+                            "status": "error" if is_error else "success",
+                            "icon": "❌" if is_error else "✅",
+                        }
+                        if call_id not in tool_order:
+                            tool_order.append(call_id)
+
+                # Build progress text
+                _update_todos_from_update(update_obj)
+
+                heading = (
+                    f"⏳ Executing /{_escape_mdv2(command_name)}\n"
+                    f"📂 {_escape_mdv2(str(relative_path))}/"
+                )
+                parts = [heading]
+
+                todo_text = _build_todo_text()
+                if todo_text:
+                    parts.append("")
+                    parts.append(todo_text)
+
+                if use_journal:
+                    journal_text = _build_journal_text()
+                    if journal_text:
+                        parts.append("")
+                        parts.append(journal_text)
+
+                # Add a short status line for non-journal mode or extra context
+                if not use_journal:
+                    if update_obj.type == "tool_call":
+                        tool_name = (update_obj.metadata or {}).get("tool_name", "tool")
+                        parts.append("")
+                        parts.append(_escape_mdv2(f"🔧 Running {tool_name.capitalize()}..."))
+                    elif update_obj.type == "tool_result":
+                        tool_name = (update_obj.metadata or {}).get("tool_name", "tool")
+                        parts.append("")
+                        parts.append(_escape_mdv2(f"✅ {tool_name.capitalize()} done"))
+
+                # Add assistant or thinking preview
                 if update_obj.type == "assistant" and update_obj.content:
-                    # Show assistant's current thought/action
                     content = update_obj.content.strip()
                     if content:
-                        # Clean up and truncate
                         if len(content) > 100:
                             content = content[:100] + "..."
-                        progress_text = (
-                            f"⏳ **Executing** `/{command_name}`\n\n" f"💭 {content}"
-                        )
+                        parts.append("")
+                        parts.append(f"💭 {_escape_mdv2(content)}")
+                elif update_obj.type == "thinking":
+                    subtype = (update_obj.metadata or {}).get("subtype")
+                    if subtype == "delta":
+                        dots = thinking_frames[thinking_index % len(thinking_frames)]
+                        thinking_index += 1
+                        parts.append("")
+                        parts.append(_escape_mdv2(f"💭 Thinking{dots}"))
+                    else:
+                        content = (update_obj.content or "").strip()
+                        if content:
+                            parts.append("")
+                            parts.append(f"💭 {_escape_mdv2(content)}")
+                        else:
+                            parts.append("")
+                            parts.append(_escape_mdv2("💭 Thinking"))
+                elif update_obj.type == "error":
+                    error_msg = update_obj.get_error_message() or "Error"
+                    parts.append("")
+                    parts.append(f"❌ {_escape_mdv2(error_msg)}")
 
-                elif update_obj.type == "tool_call":
-                    # Show tool being used
-                    tool_name = "Tool"
-                    if update_obj.metadata:
-                        tool_name = update_obj.metadata.get("tool_name", "tool")
-                        tool_name = tool_name.capitalize()
-                    progress_text = (
-                        f"⏳ **Executing** `/{command_name}`\n\n"
-                        f"🔧 Running {tool_name}..."
-                    )
-
-                elif update_obj.type == "tool_result":
-                    # Show tool completion
-                    tool_name = "Tool"
-                    if update_obj.metadata:
-                        tool_name = update_obj.metadata.get("tool_name", "tool")
-                        tool_name = tool_name.capitalize()
-                    progress_text = (
-                        f"⏳ **Executing** `/{command_name}`\n\n" f"✅ {tool_name} done"
-                    )
+                progress_text = "\n".join(p for p in parts if p is not None)
 
                 # Throttle updates (0.8 seconds minimum)
                 if progress_text and progress_text != last_progress_text:
                     if current_time - last_update_time >= 0.8:
                         try:
                             await progress_msg.edit_text(
-                                progress_text, parse_mode="Markdown"
+                                progress_text, parse_mode="MarkdownV2"
                             )
                             last_progress_text = progress_text
                             last_update_time = current_time

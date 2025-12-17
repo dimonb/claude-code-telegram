@@ -21,6 +21,20 @@ from ...security.validators import SecurityValidator
 logger = structlog.get_logger()
 tracer = trace.get_tracer("telegram.handlers")
 
+TODO_CHECKBOX = {
+    "TODO_STATUS_PENDING": "[ ]",
+    "TODO_STATUS_IN_PROGRESS": "[-]",
+    "TODO_STATUS_COMPLETED": "[x]",
+    "TODO_STATUS_BLOCKED": "[!]",
+}
+
+TODO_LABEL = {
+    "TODO_STATUS_PENDING": "pending",
+    "TODO_STATUS_IN_PROGRESS": "in progress",
+    "TODO_STATUS_COMPLETED": "completed",
+    "TODO_STATUS_BLOCKED": "blocked",
+}
+
 
 def _format_tool_name(tool_name: str) -> str:
     """Format tool name for display."""
@@ -48,7 +62,7 @@ def _format_tool_params(params: dict, max_length: int = 50) -> str:
         if isinstance(value, str):
             if len(value) > 30:
                 value = value[:30] + "..."
-            parts.append(f"{key}=\"{value}\"")
+            parts.append(f'{key}="{value}"')
         elif isinstance(value, (int, float, bool)) or value is None:
             parts.append(f"{key}={value}")
         else:
@@ -71,9 +85,7 @@ def _format_tool_params(params: dict, max_length: int = 50) -> str:
 
 
 def _format_progress_update(
-    update_obj: "StreamUpdate",
-    tool_journal: dict = None,
-    tool_order: list = None
+    update_obj: "StreamUpdate", tool_journal: dict = None, tool_order: list = None
 ) -> Optional[str]:
     """Format progress updates with enhanced context and visual indicators."""
     # Build tool journal section if we have tools
@@ -83,7 +95,7 @@ def _format_progress_update(
             "Formatting progress with tool journal",
             update_type=update_obj.type,
             journal_size=len(tool_journal),
-            tools_count=len(tool_order)
+            tools_count=len(tool_order),
         )
         for call_id in tool_order:
             if call_id in tool_journal:
@@ -190,6 +202,54 @@ def _format_progress_update(
         return journal_text + "🤔 Processing..."
 
     return None
+
+
+def _normalize_todo_payload(todos_payload: object) -> dict:
+    """Convert todo payload into a normalized mapping keyed by id."""
+    items = []
+    if isinstance(todos_payload, list):
+        items = [i for i in todos_payload if isinstance(i, dict)]
+    elif isinstance(todos_payload, dict):
+        todos_list = todos_payload.get("todos") or todos_payload.get("items")
+        if isinstance(todos_list, list):
+            items = [i for i in todos_list if isinstance(i, dict)]
+        elif todos_payload.get("id"):
+            items = [todos_payload]
+
+    normalized = {}
+    for item in items:
+        todo_id = str(item.get("id") or item.get("content") or "")
+        if not todo_id:
+            continue
+
+        normalized[todo_id] = {
+            "id": todo_id,
+            "content": item.get("content") or todo_id,
+            "status": item.get("status", "TODO_STATUS_PENDING"),
+            "dependencies": item.get("dependencies", []),
+            "createdAt": item.get("createdAt"),
+            "updatedAt": item.get("updatedAt"),
+        }
+
+    return normalized
+
+
+def _render_todo_list(todos: dict) -> Optional[str]:
+    """Render todos as a checkbox list with statuses."""
+    if not todos:
+        return None
+
+    lines = ["📋 TODO"]
+    for todo in sorted(
+        todos.values(), key=lambda t: (str(t.get("createdAt") or ""), t["id"])
+    ):
+        status = todo.get("status", "TODO_STATUS_PENDING")
+        checkbox = TODO_CHECKBOX.get(status, "[ ]")
+        label = TODO_LABEL.get(status, status)
+        content = todo.get("content") or todo.get("id")
+        lines.append(f"- {checkbox} {content} ({label})")
+
+    return "\n".join(lines)
 
 
 def _format_error_message(error_str: str) -> str:
@@ -419,7 +479,7 @@ async def handle_text_message(
                                 "name": tool_name,
                                 "params": params,
                                 "status": "running",
-                                "icon": "⏳"
+                                "icon": "⏳",
                             }
                             if call_id not in tool_order:
                                 tool_order.append(call_id)
@@ -427,7 +487,7 @@ async def handle_text_message(
                                 "Tool started, added to journal",
                                 call_id=call_id,
                                 tool_name=tool_name,
-                                journal_size=len(tool_journal)
+                                journal_size=len(tool_journal),
                             )
 
                     elif update_obj.type == "tool_result":
@@ -437,7 +497,9 @@ async def handle_text_message(
                         if call_id:
                             existing_entry = tool_journal.get(call_id, {})
                             params = existing_entry.get("params", {})
-                            tool_name = existing_entry.get("name", metadata.get("tool_name", "tool"))
+                            tool_name = existing_entry.get(
+                                "name", metadata.get("tool_name", "tool")
+                            )
 
                             # Keep args/name up to date if completion carries details
                             if update_obj.tool_calls and len(update_obj.tool_calls) > 0:
@@ -447,7 +509,10 @@ async def handle_text_message(
                             if not params:
                                 params = metadata.get("tool_args", params)
 
-                            is_error = update_obj.is_error() or metadata.get("status") == "error"
+                            is_error = (
+                                update_obj.is_error()
+                                or metadata.get("status") == "error"
+                            )
 
                             tool_journal[call_id] = {
                                 "name": tool_name,
@@ -456,6 +521,44 @@ async def handle_text_message(
                                 "icon": "❌" if is_error else "✅",
                             }
 
+                            # Update session-scoped todos when cursor-agent updateTodos tool completes
+                            if tool_name and tool_name.lower() == "updatetodos":
+                                session_id_for_todos = (
+                                    update_obj.session_context or {}
+                                ).get("session_id") or context.user_data.get(
+                                    "claude_session_id"
+                                )
+
+                                todos_payload = None
+                                if (
+                                    update_obj.tool_calls
+                                    and len(update_obj.tool_calls) > 0
+                                ):
+                                    tool_call_data = update_obj.tool_calls[0]
+                                    todos_payload = tool_call_data.get("result")
+                                    if todos_payload is None:
+                                        todos_payload = tool_call_data.get("input")
+                                if todos_payload is None:
+                                    todos_payload = metadata.get("tool_args")
+
+                                normalized_todos = _normalize_todo_payload(
+                                    todos_payload
+                                )
+                                if normalized_todos and session_id_for_todos:
+                                    session_todos = context.user_data.setdefault(
+                                        "session_todos", {}
+                                    )
+                                    existing_todos = session_todos.get(
+                                        session_id_for_todos, {}
+                                    )
+                                    merged_todos = {**existing_todos}
+                                    for todo_id, todo_data in normalized_todos.items():
+                                        merged_todos[todo_id] = {
+                                            **existing_todos.get(todo_id, {}),
+                                            **todo_data,
+                                        }
+                                    session_todos[session_id_for_todos] = merged_todos
+
                             if call_id not in tool_order:
                                 tool_order.append(call_id)
 
@@ -463,10 +566,12 @@ async def handle_text_message(
                                 "Tool completed, updated in journal",
                                 call_id=call_id,
                                 tool_name=tool_name,
-                                is_error=is_error
+                                is_error=is_error,
                             )
 
-                    progress_text = _format_progress_update(update_obj, tool_journal, tool_order)
+                    progress_text = _format_progress_update(
+                        update_obj, tool_journal, tool_order
+                    )
 
                     # Throttle updates to prevent flickering
                     current_time = time.time()
@@ -530,6 +635,16 @@ async def handle_text_message(
                 formatted_messages = formatter.format_claude_response(
                     claude_response.content
                 )
+
+                todo_text = _render_todo_list(
+                    (context.user_data.get("session_todos") or {}).get(
+                        claude_response.session_id, {}
+                    )
+                )
+                if todo_text and formatted_messages:
+                    formatted_messages[-1].text = (
+                        f"{formatted_messages[-1].text}\n\n{todo_text}"
+                    )
 
             except ClaudeToolValidationError as e:
                 # Tool validation error with detailed instructions
@@ -931,6 +1046,16 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     claude_response.content
                 )
 
+                todo_text = _render_todo_list(
+                    (context.user_data.get("session_todos") or {}).get(
+                        claude_response.session_id, {}
+                    )
+                )
+                if todo_text and formatted_messages:
+                    formatted_messages[-1].text = (
+                        f"{formatted_messages[-1].text}\n\n{todo_text}"
+                    )
+
                 # Delete progress message
                 await claude_progress_msg.delete()
 
@@ -1080,6 +1205,16 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                     formatted_messages = formatter.format_claude_response(
                         claude_response.content
                     )
+
+                    todo_text = _render_todo_list(
+                        (context.user_data.get("session_todos") or {}).get(
+                            claude_response.session_id, {}
+                        )
+                    )
+                    if todo_text and formatted_messages:
+                        formatted_messages[-1].text = (
+                            f"{formatted_messages[-1].text}\n\n{todo_text}"
+                        )
 
                     # Delete progress message
                     await claude_progress_msg.delete()
