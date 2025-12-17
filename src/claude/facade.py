@@ -12,6 +12,7 @@ from opentelemetry.trace import Status, StatusCode
 
 from ..config.settings import Settings
 from ..utils import ensure_utc
+from .cursor_agent_integration import CursorAgentManager
 from .exceptions import ClaudeToolValidationError
 from .integration import ClaudeProcessManager, ClaudeResponse, StreamUpdate
 from .monitor import ToolMonitor
@@ -20,6 +21,9 @@ from .session import SessionManager
 
 logger = structlog.get_logger()
 tracer = trace.get_tracer("claude.facade")
+
+# Type alias for manager types
+AgentManager = Union[CursorAgentManager, ClaudeSDKManager, ClaudeProcessManager]
 
 
 class ClaudeIntegration:
@@ -30,27 +34,45 @@ class ClaudeIntegration:
         config: Settings,
         process_manager: Optional[ClaudeProcessManager] = None,
         sdk_manager: Optional[ClaudeSDKManager] = None,
+        cursor_agent_manager: Optional[CursorAgentManager] = None,
         session_manager: Optional[SessionManager] = None,
         tool_monitor: Optional[ToolMonitor] = None,
     ):
-        """Initialize Claude integration facade."""
+        """Initialize Claude integration facade.
+
+        Agent selection is based on configuration (no fallback):
+        1. use_cursor_agent=True -> CursorAgentManager
+        2. use_sdk=True -> ClaudeSDKManager
+        3. Default -> ClaudeProcessManager
+        """
         self.config = config
 
-        # Initialize both managers for fallback capability
-        self.sdk_manager = (
-            sdk_manager or ClaudeSDKManager(config) if config.use_sdk else None
-        )
-        self.process_manager = process_manager or ClaudeProcessManager(config)
+        # Store all managers for reference
+        self.cursor_agent_manager: Optional[CursorAgentManager] = None
+        self.sdk_manager: Optional[ClaudeSDKManager] = None
+        self.process_manager: Optional[ClaudeProcessManager] = None
 
-        # Use SDK by default if configured
-        if config.use_sdk:
+        # Initialize manager based on configuration (NO FALLBACK)
+        if getattr(config, "use_cursor_agent", False):
+            self.cursor_agent_manager = cursor_agent_manager or CursorAgentManager(
+                config
+            )
+            self.manager: AgentManager = self.cursor_agent_manager
+            self._agent_type = "cursor-agent"
+            logger.info("Using cursor-agent for AI integration")
+        elif config.use_sdk:
+            self.sdk_manager = sdk_manager or ClaudeSDKManager(config)
             self.manager = self.sdk_manager
+            self._agent_type = "claude-sdk"
+            logger.info("Using Claude SDK for AI integration")
         else:
+            self.process_manager = process_manager or ClaudeProcessManager(config)
             self.manager = self.process_manager
+            self._agent_type = "claude-cli"
+            logger.info("Using Claude CLI subprocess for AI integration")
 
         self.session_manager = session_manager
         self.tool_monitor = tool_monitor
-        self._sdk_failed_count = 0  # Track SDK failures for adaptive fallback
 
     async def run_command(
         self,
@@ -139,8 +161,7 @@ class ClaudeIntegration:
             span.set_attribute("working_directory", str(working_directory))
             span.set_attribute("has_session_id", bool(session_id))
             span.set_attribute("prompt_length", len(prompt))
-            span.set_attribute("use_sdk", bool(self.sdk_manager))
-            span.set_attribute("use_subprocess", bool(self.process_manager))
+            span.set_attribute("agent_type", self._agent_type)
 
             try:
                 # Only continue session if it's not a new session
@@ -155,7 +176,7 @@ class ClaudeIntegration:
                     else session.session_id
                 )
 
-                response = await self._execute_with_fallback(
+                response = await self._execute(
                     prompt=prompt,
                     working_directory=working_directory,
                     session_id=claude_session_id,
@@ -261,7 +282,7 @@ class ClaudeIntegration:
                 )
                 raise
 
-    async def _execute_with_fallback(
+    async def _execute(
         self,
         prompt: str,
         working_directory: Path,
@@ -269,163 +290,20 @@ class ClaudeIntegration:
         continue_session: bool = False,
         stream_callback: Optional[Callable] = None,
     ) -> ClaudeResponse:
-        """Execute command with SDK->subprocess fallback on JSON decode errors."""
-        # Try SDK first if configured
-        if self.config.use_sdk and self.sdk_manager:
-            try:
-                logger.debug("Attempting Claude SDK execution")
-                response = await self.sdk_manager.execute_command(
-                    prompt=prompt,
-                    working_directory=working_directory,
-                    session_id=session_id,
-                    continue_session=continue_session,
-                    stream_callback=stream_callback,
-                )
-                # Reset failure count on success
-                self._sdk_failed_count = 0
-                return response
+        """Execute command using configured agent (no fallback)."""
+        logger.debug(
+            "Executing with agent",
+            agent_type=self._agent_type,
+            working_directory=str(working_directory),
+        )
 
-            except RuntimeError as e:
-                # Handle cancel scope errors gracefully
-                error_str = str(e)
-                if (
-                    "cancel scope" in error_str.lower()
-                    or "different task" in error_str.lower()
-                ):
-                    logger.warning(
-                        "Cancel scope error in Claude SDK (likely due to task cancellation)",
-                        error=error_str,
-                    )
-                    # Check if this is a limit reached error wrapped in cancel scope error
-                    # In that case, we should still raise it as ClaudeProcessError
-                    from .exceptions import ClaudeProcessError
-
-                    raise ClaudeProcessError(
-                        "Claude SDK operation was cancelled"
-                    ) from None
-                else:
-                    # Re-raise other RuntimeErrors
-                    raise
-
-            except Exception as e:
-                error_str = str(e)
-
-                # Check if this is a known error that should NOT trigger fallback
-                # These are real errors, not SDK issues
-                if "limit reached" in error_str.lower():
-                    logger.info(
-                        "Claude limit reached, not using fallback",
-                        error=error_str,
-                    )
-                    raise
-
-                # Check if this is a JSON decode error that indicates SDK issues
-                if (
-                    "Failed to decode JSON" in error_str
-                    or "JSON decode error" in error_str
-                    or "TaskGroup" in error_str
-                    or "ExceptionGroup" in error_str
-                    or (
-                        "cancel scope" in error_str.lower()
-                        and "different task" in error_str.lower()
-                    )
-                ):
-                    self._sdk_failed_count += 1
-
-                    # Extract context about what caused the error
-                    is_tool_result_error = (
-                        "tool_use_id" in error_str or "tool_result" in error_str.lower()
-                    )
-                    is_large_content = (
-                        len(error_str) > 500
-                    )  # Truncated errors suggest large content
-
-                    logger.warning(
-                        "Claude SDK failed with JSON/TaskGroup error, falling back to subprocess",
-                        error=error_str[:500],  # Truncate very long errors
-                        failure_count=self._sdk_failed_count,
-                        error_type=type(e).__name__,
-                        likely_cause=(
-                            "large_tool_result"
-                            if is_tool_result_error
-                            else "sdk_parsing_issue"
-                        ),
-                        is_large_content=is_large_content,
-                        hint="This typically happens with large tool outputs (HTTP responses, file reads, etc). Fallback to subprocess will handle it.",
-                    )
-
-                    # Use subprocess fallback
-                    try:
-                        logger.info("Executing with subprocess fallback")
-                        response = await self.process_manager.execute_command(
-                            prompt=prompt,
-                            working_directory=working_directory,
-                            session_id=session_id,
-                            continue_session=continue_session,
-                            stream_callback=stream_callback,
-                        )
-                        logger.info("Subprocess fallback succeeded")
-                        return response
-
-                    except Exception as fallback_error:
-                        fallback_error_str = str(fallback_error)
-                        logger.error(
-                            "Both SDK and subprocess failed",
-                            sdk_error=error_str,
-                            subprocess_error=fallback_error_str,
-                        )
-
-                        # Prioritize more informative errors from fallback
-                        # Session errors are more actionable than JSON decode errors
-                        if (
-                            "no conversation found" in fallback_error_str.lower()
-                            or "conversation not found" in fallback_error_str.lower()
-                            or "session not found" in fallback_error_str.lower()
-                            or "session could not be found"
-                            in fallback_error_str.lower()
-                        ):
-                            logger.info(
-                                "Prioritizing fallback error over SDK JSON decode error",
-                                fallback_error=fallback_error_str,
-                            )
-                            raise fallback_error
-
-                        # For other fallback errors, prefer them if they're more specific
-                        # JSON decode errors are usually symptoms, not root causes
-                        if (
-                            "limit reached" in fallback_error_str.lower()
-                            or "timeout" in fallback_error_str.lower()
-                            or "process error" in fallback_error_str.lower()
-                        ):
-                            logger.info(
-                                "Prioritizing fallback error over SDK JSON decode error",
-                                fallback_error=fallback_error_str,
-                            )
-                            raise fallback_error
-
-                        # Otherwise, raise the fallback error with context about SDK failure
-                        from .exceptions import ClaudeProcessError
-
-                        raise ClaudeProcessError(
-                            f"Claude execution failed: {fallback_error_str} "
-                            f"(SDK also failed with JSON decode error)"
-                        ) from fallback_error
-                else:
-                    # For non-JSON errors, re-raise immediately
-                    logger.error(
-                        "Claude SDK failed with non-JSON error", error=error_str
-                    )
-                    raise
-        else:
-            # Use subprocess directly if SDK not configured
-            logger.debug("Using subprocess execution (SDK disabled)")
-            return await self.process_manager.execute_command(
-                prompt=prompt,
-                working_directory=working_directory,
-                session_id=session_id,
-                continue_session=continue_session,
-                stream_callback=stream_callback,
-            )
+        return await self.manager.execute_command(
+            prompt=prompt,
+            working_directory=working_directory,
+            session_id=session_id,
+            continue_session=continue_session,
+            stream_callback=stream_callback,
+        )
 
     async def continue_session(
         self,
@@ -511,7 +389,7 @@ class ClaudeIntegration:
 
     async def shutdown(self) -> None:
         """Shutdown integration and cleanup resources."""
-        logger.info("Shutting down Claude integration")
+        logger.info("Shutting down Claude integration", agent_type=self._agent_type)
 
         # Kill any active processes
         await self.manager.kill_all_processes()
@@ -520,6 +398,10 @@ class ClaudeIntegration:
         await self.cleanup_expired_sessions()
 
         logger.info("Claude integration shutdown complete")
+
+    def get_agent_type(self) -> str:
+        """Get the current agent type."""
+        return self._agent_type
 
     def _get_admin_instructions(self, blocked_tools: List[str]) -> str:
         """Generate admin instructions for enabling blocked tools."""

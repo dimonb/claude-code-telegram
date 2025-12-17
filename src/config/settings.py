@@ -97,6 +97,28 @@ class Settings(BaseSettings):
         description="List of explicitly disallowed Claude tools/commands",
     )
 
+    # Cursor Agent settings
+    use_cursor_agent: bool = Field(
+        False,
+        description="Use cursor-agent instead of Claude SDK/CLI",
+    )
+    cursor_agent_binary_path: Optional[str] = Field(
+        None,
+        description="Path to cursor-agent binary",
+    )
+    cursor_agent_model: Optional[str] = Field(
+        None,
+        description="Model for cursor-agent (e.g., sonnet-4, gpt-5, sonnet-4-thinking)",
+    )
+    cursor_agent_approve_mcps: bool = Field(
+        True,
+        description="Auto-approve MCP servers in cursor-agent",
+    )
+    cursor_agent_force_mode: bool = Field(
+        True,
+        description="Force allow commands in cursor-agent (-f flag)",
+    )
+
     # Rate limiting
     rate_limit_requests: int = Field(
         DEFAULT_RATE_LIMIT_REQUESTS, description="Requests per window"

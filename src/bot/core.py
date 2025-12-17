@@ -88,6 +88,7 @@ class ClaudeCodeBot:
             BotCommand("help", "Show available commands"),
             BotCommand("new", "Start new Claude session"),
             BotCommand("continue", "Continue last session"),
+            BotCommand("commands", "Show project commands from .claude/commands"),
             BotCommand("ls", "List files in current directory"),
             BotCommand("cd", "Change directory"),
             BotCommand("pwd", "Show current directory"),
@@ -120,6 +121,7 @@ class ClaudeCodeBot:
             ("export", command.export_session),
             ("actions", command.quick_actions),
             ("git", command.git_command),
+            ("commands", command.project_commands),
         ]
 
         for cmd, handler in handlers:

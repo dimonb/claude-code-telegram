@@ -1,7 +1,10 @@
 """Handle inline keyboard callbacks."""
 
+import re
+
 import structlog
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
 from ...claude.facade import ClaudeIntegration
@@ -10,6 +13,101 @@ from ...security.audit import AuditLogger
 from ...security.validators import SecurityValidator
 
 logger = structlog.get_logger()
+
+
+def _markdown_to_html(text: str) -> str:
+    """Convert basic Markdown to Telegram HTML.
+
+    Handles:
+    - **bold** -> <b>bold</b>
+    - *italic* or _italic_ -> <i>italic</i>
+    - `code` -> <code>code</code>
+    - ```code block``` -> <pre>code block</pre>
+    - [text](url) -> <a href="url">text</a>
+    - Headers (# ## ###) -> <b>Header</b>
+    """
+    # Escape HTML special chars first (but preserve our conversions)
+    text = text.replace("&", "&amp;")
+    text = text.replace("<", "&lt;")
+    text = text.replace(">", "&gt;")
+
+    # Code blocks (must be before inline code)
+    text = re.sub(
+        r"```(?:\w+)?\n?(.*?)```",
+        r"<pre>\1</pre>",
+        text,
+        flags=re.DOTALL,
+    )
+
+    # Inline code
+    text = re.sub(r"`([^`]+)`", r"<code>\1</code>", text)
+
+    # Bold (**text** or __text__)
+    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
+    text = re.sub(r"__(.+?)__", r"<b>\1</b>", text)
+
+    # Italic (*text* or _text_) - careful not to match inside words
+    text = re.sub(r"(?<!\w)\*([^*]+)\*(?!\w)", r"<i>\1</i>", text)
+    text = re.sub(r"(?<!\w)_([^_]+)_(?!\w)", r"<i>\1</i>", text)
+
+    # Links [text](url)
+    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r'<a href="\2">\1</a>', text)
+
+    # Headers (# Header) -> bold
+    text = re.sub(r"^#{1,6}\s+(.+)$", r"<b>\1</b>", text, flags=re.MULTILINE)
+
+    return text
+
+
+async def _safe_send_message(
+    message,
+    text: str,
+    parse_mode: str = "Markdown",
+    **kwargs,
+):
+    """Send message with fallback if parse mode fails.
+
+    Tries: Markdown -> HTML -> Plain text
+    """
+    try:
+        return await message.reply_text(text, parse_mode=parse_mode, **kwargs)
+    except BadRequest as e:
+        if "can't parse entities" in str(e).lower():
+            logger.warning(
+                "Markdown parse failed, trying HTML",
+                error=str(e),
+            )
+            try:
+                # Convert to HTML
+                html_text = _markdown_to_html(text)
+                return await message.reply_text(html_text, parse_mode="HTML", **kwargs)
+            except BadRequest as e2:
+                logger.warning(
+                    "HTML parse failed, sending plain text",
+                    error=str(e2),
+                )
+                # Strip all formatting and send plain
+                plain_text = re.sub(r"[*_`#\[\]()]", "", text)
+                return await message.reply_text(plain_text, **kwargs)
+        raise
+
+
+def _split_for_telegram(text: str, limit: int = 3800) -> list[str]:
+    """Split long text into Telegram-safe chunks."""
+    parts: list[str] = []
+    remaining = text
+
+    while len(remaining) > limit:
+        split_idx = remaining.rfind("\n", 0, limit)
+        if split_idx == -1 or split_idx < int(limit * 0.5):
+            split_idx = limit
+        parts.append(remaining[:split_idx].rstrip())
+        remaining = remaining[split_idx:]
+
+    if remaining.strip():
+        parts.append(remaining.strip())
+
+    return parts
 
 
 async def handle_callback_query(
@@ -42,6 +140,7 @@ async def handle_callback_query(
             "conversation": handle_conversation_callback,
             "git": handle_git_callback,
             "export": handle_export_callback,
+            "pcmd": handle_project_command_callback,  # Project commands from .claude/commands
         }
 
         handler = handlers.get(action)
@@ -633,9 +732,7 @@ async def _handle_ls_action(query, context: ContextTypes.DEFAULT_TYPE) -> None:
                 try:
                     size = item.stat().st_size
                     size_str = _format_file_size(size)
-                    files.append(
-                        f"📄 {_escape_markdown(item.name)} ({size_str})"
-                    )
+                    files.append(f"📄 {_escape_markdown(item.name)} ({size_str})")
                 except OSError:
                     files.append(f"📄 {_escape_markdown(item.name)}")
 
@@ -727,8 +824,7 @@ async def _handle_quick_actions_action(
     features = context.bot_data.get("features")
     if not features or not features.is_enabled("quick_actions"):
         await query.edit_message_text(
-            "❌ **Quick Actions Disabled**\n\n"
-            "Quick actions feature is not enabled."
+            "❌ **Quick Actions Disabled**\n\n" "Quick actions feature is not enabled."
         )
         return
 
@@ -1079,8 +1175,10 @@ async def handle_git_callback(
             else:
                 # Clean up diff output for Telegram
                 # Remove emoji symbols that interfere with markdown parsing
-                clean_diff = diff_output.replace("➕", "+").replace("➖", "-").replace("📍", "@")
-                
+                clean_diff = (
+                    diff_output.replace("➕", "+").replace("➖", "-").replace("📍", "@")
+                )
+
                 # Limit diff output
                 max_length = 2000
                 if len(clean_diff) > max_length:
@@ -1234,3 +1332,195 @@ def _escape_markdown(text: str) -> str:
     for ch in escape_chars:
         text = text.replace(ch, f"\\{ch}")
     return text
+
+
+async def handle_project_command_callback(
+    query, command_name: str, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Handle project command button press from .claude/commands/."""
+    user_id = query.from_user.id
+    settings: Settings = context.bot_data["settings"]
+    claude_integration: ClaudeIntegration = context.bot_data.get("claude_integration")
+    audit_logger: AuditLogger = context.bot_data.get("audit_logger")
+
+    # Get current directory
+    current_dir = context.user_data.get(
+        "current_directory", settings.approved_directory
+    )
+    relative_path = current_dir.relative_to(settings.approved_directory)
+
+    try:
+        # Import project commands module
+        from ..features.project_commands import (
+            find_command_by_name,
+            get_project_commands,
+            read_command_content,
+        )
+
+        # Get available commands
+        commands = get_project_commands(current_dir)
+        command = find_command_by_name(commands, command_name)
+
+        if not command:
+            await query.edit_message_text(
+                f"❌ **Command Not Found**\n\n"
+                f"Command `/{command_name}` is not available.\n\n"
+                f"The command file may have been removed.\n"
+                f"Use `/commands` to see available commands.",
+                parse_mode="Markdown",
+            )
+            return
+
+        # Show executing message
+        progress_msg = await query.edit_message_text(
+            f"⏳ **Executing** `/{command_name}`\n\n"
+            f"📂 Directory: `{relative_path}/`\n\n"
+            f"🔄 Starting...",
+            parse_mode="Markdown",
+        )
+
+        # Check if Claude integration is available
+        if not claude_integration:
+            await query.edit_message_text(
+                "❌ **AI Agent Not Available**\n\n"
+                "Claude/Cursor integration is not properly configured.\n"
+                "Contact your administrator."
+            )
+            return
+
+        # Read command content (the prompt)
+        prompt = read_command_content(command)
+
+        # Stream handler for progress updates
+        import time
+
+        last_progress_text = ""
+        last_update_time = 0.0
+
+        async def stream_handler(update_obj):
+            nonlocal last_progress_text, last_update_time
+            try:
+                current_time = time.time()
+
+                # Format progress based on update type
+                progress_text = None
+
+                if update_obj.type == "assistant" and update_obj.content:
+                    # Show assistant's current thought/action
+                    content = update_obj.content.strip()
+                    if content:
+                        # Clean up and truncate
+                        if len(content) > 100:
+                            content = content[:100] + "..."
+                        progress_text = (
+                            f"⏳ **Executing** `/{command_name}`\n\n" f"💭 {content}"
+                        )
+
+                elif update_obj.type == "tool_call":
+                    # Show tool being used
+                    tool_name = "Tool"
+                    if update_obj.metadata:
+                        tool_name = update_obj.metadata.get("tool_name", "tool")
+                        tool_name = tool_name.capitalize()
+                    progress_text = (
+                        f"⏳ **Executing** `/{command_name}`\n\n"
+                        f"🔧 Running {tool_name}..."
+                    )
+
+                elif update_obj.type == "tool_result":
+                    # Show tool completion
+                    tool_name = "Tool"
+                    if update_obj.metadata:
+                        tool_name = update_obj.metadata.get("tool_name", "tool")
+                        tool_name = tool_name.capitalize()
+                    progress_text = (
+                        f"⏳ **Executing** `/{command_name}`\n\n" f"✅ {tool_name} done"
+                    )
+
+                # Throttle updates (0.8 seconds minimum)
+                if progress_text and progress_text != last_progress_text:
+                    if current_time - last_update_time >= 0.8:
+                        try:
+                            await progress_msg.edit_text(
+                                progress_text, parse_mode="Markdown"
+                            )
+                            last_progress_text = progress_text
+                            last_update_time = current_time
+                        except BadRequest:
+                            pass  # Message not modified or other issue
+
+            except Exception as e:
+                logger.warning("Stream handler error", error=str(e))
+
+        # Execute the command via Claude integration with streaming
+        claude_response = await claude_integration.run_command(
+            prompt=prompt,
+            working_directory=current_dir,
+            user_id=user_id,
+            on_stream=stream_handler,
+        )
+
+        # Update session ID in context if we got one
+        if claude_response and claude_response.session_id:
+            context.user_data["claude_session_id"] = claude_response.session_id
+
+        if claude_response:
+            # Format response
+            response_content = claude_response.content or ""
+            full_text = f"✅ **/{command_name}** completed\n\n{response_content}"
+
+            # Send full result, split into safe chunks if needed
+            for part in _split_for_telegram(full_text):
+                await _safe_send_message(
+                    query.message,
+                    part,
+                    parse_mode="Markdown",
+                )
+
+            # Log success
+            if audit_logger:
+                await audit_logger.log_command(
+                    user_id=user_id,
+                    command=f"pcmd:{command_name}",
+                    args=[],
+                    success=True,
+                )
+
+            logger.info(
+                "Project command executed",
+                user_id=user_id,
+                command=command_name,
+                duration_ms=claude_response.duration_ms,
+            )
+        else:
+            await query.edit_message_text(
+                f"❌ **Command Failed**\n\n"
+                f"Failed to execute `/{command_name}`.\n"
+                f"Please try again or check the command file.",
+                parse_mode="Markdown",
+            )
+
+    except Exception as e:
+        error_msg = str(e)
+        logger.exception(
+            "Error executing project command",
+            error=error_msg,
+            user_id=user_id,
+            command=command_name,
+        )
+
+        await query.edit_message_text(
+            f"❌ **Error Executing Command**\n\n"
+            f"Command: `/{command_name}`\n"
+            f"Error: `{error_msg[:200]}`\n\n"
+            f"Try again or contact support.",
+            parse_mode="Markdown",
+        )
+
+        if audit_logger:
+            await audit_logger.log_command(
+                user_id=user_id,
+                command=f"pcmd:{command_name}",
+                args=[],
+                success=False,
+            )

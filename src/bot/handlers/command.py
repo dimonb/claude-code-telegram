@@ -953,3 +953,96 @@ def _escape_markdown(text: str) -> str:
     for ch in escape_chars:
         text = text.replace(ch, f"\\{ch}")
     return text
+
+
+@tracer.start_as_current_span("command.project_commands")
+async def project_commands(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /commands to show available project commands from .claude/commands/."""
+    user_id = update.effective_user.id
+    settings: Settings = context.bot_data["settings"]
+    audit_logger: AuditLogger = context.bot_data.get("audit_logger")
+
+    # Get current directory
+    current_dir = context.user_data.get(
+        "current_directory", settings.approved_directory
+    )
+    relative_path = current_dir.relative_to(settings.approved_directory)
+
+    try:
+        # Import project commands module
+        from ..features.project_commands import (
+            build_commands_keyboard,
+            format_commands_list,
+            get_project_commands,
+        )
+
+        # Get available commands
+        commands = get_project_commands(current_dir)
+
+        if not commands:
+            await update.message.reply_text(
+                f"📋 **No Project Commands**\n\n"
+                f"Directory: `{relative_path}/`\n\n"
+                f"No commands found in `.claude/commands/`\n\n"
+                f"**To add commands:**\n"
+                f"1. Create a `.claude/commands/` directory in your project\n"
+                f"2. Add `.md` files with command instructions\n"
+                f"3. Use `/commands` to see available commands\n\n"
+                f"**Example structure:**\n"
+                f"```\n"
+                f".claude/\n"
+                f"└── commands/\n"
+                f"    ├── build.md\n"
+                f"    ├── test.md\n"
+                f"    └── deploy.md\n"
+                f"```",
+                parse_mode="Markdown",
+            )
+            return
+
+        # Build keyboard with command buttons
+        keyboard = build_commands_keyboard(commands, columns=2)
+
+        # Format commands list
+        commands_text = format_commands_list(commands)
+
+        await update.message.reply_text(
+            f"📋 **Project Commands** ({len(commands)})\n\n"
+            f"Directory: `{relative_path}/`\n\n"
+            f"{commands_text}\n\n"
+            f"Click a button to execute:",
+            parse_mode="Markdown",
+            reply_markup=keyboard,
+        )
+
+        # Log command
+        if audit_logger:
+            await audit_logger.log_command(
+                user_id=user_id,
+                command="commands",
+                args=[],
+                success=True,
+            )
+
+    except Exception as e:
+        error_msg = str(e)
+        logger.exception(
+            "Error in project_commands command",
+            error=error_msg,
+            user_id=user_id,
+        )
+
+        await update.message.reply_text(
+            f"❌ **Error Loading Commands**\n\n"
+            f"`{error_msg}`\n\n"
+            f"Try again or check the `.claude/commands/` directory.",
+            parse_mode="Markdown",
+        )
+
+        if audit_logger:
+            await audit_logger.log_command(
+                user_id=user_id,
+                command="commands",
+                args=[],
+                success=False,
+            )

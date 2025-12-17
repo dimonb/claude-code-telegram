@@ -132,27 +132,63 @@ src/
 4. **Middleware Chain**: Security → Auth → Rate Limiting (negative group numbers)
 5. **Feature Registry**: Dynamic feature loading in `bot/features/registry.py`
 
-### Claude Integration Modes
+### AI Agent Integration Modes
 
-The bot supports two Claude integration modes with automatic fallback:
+The bot supports three AI agent integration modes, **configured explicitly** (no automatic fallback):
 
-1. **SDK Mode** (default, `USE_SDK=true`)
+1. **Cursor Agent Mode** (`USE_CURSOR_AGENT=true`)
+   - Uses `cursor-agent` CLI with stream-json output
+   - Full MCP (Model Context Protocol) support
+   - Thinking output streaming
+   - Implemented in `claude/cursor_agent_integration.py`
+   - Requires cursor-agent installed and authenticated
+   - Supports `.claude/commands/` project commands
+
+2. **SDK Mode** (`USE_SDK=true`, `USE_CURSOR_AGENT=false`)
    - Uses `claude-agent-sdk` Python package (v0.1.17+)
    - Direct API integration with streaming support
    - Implemented in `claude/sdk_integration.py`
    - Requires CLI authentication OR `ANTHROPIC_API_KEY`
    - Uses SDK-native security hooks for tool validation
-   - **Known Issue:** Large tool outputs (>50KB) can cause JSON parsing errors
-   - Automatically falls back to subprocess mode on parse errors
 
-2. **CLI Subprocess Mode** (`USE_SDK=false`)
+3. **CLI Subprocess Mode** (`USE_SDK=false`, `USE_CURSOR_AGENT=false`)
    - Spawns Claude CLI as subprocess
-   - Fallback mechanism when SDK fails
    - Implemented in `claude/integration.py`
    - Requires Claude CLI installed and authenticated
    - More stable with very large tool outputs
 
-**Automatic Fallback:** When SDK mode fails with JSON decode errors (typically from large HTTP responses, file reads, or grep results), the system automatically falls back to subprocess mode. This is expected behavior and logged at WARNING level.
+**Configuration Priority:**
+```bash
+# Priority 1: cursor-agent
+USE_CURSOR_AGENT=true
+
+# Priority 2: Claude SDK  
+USE_SDK=true
+USE_CURSOR_AGENT=false
+
+# Priority 3: Claude CLI subprocess (default)
+USE_SDK=false
+USE_CURSOR_AGENT=false
+```
+
+> **Note:** No automatic fallback between modes. If selected agent fails, an error is returned.
+
+### Project Commands (`.claude/commands/`)
+
+Projects can define custom commands in `.claude/commands/*.md` files:
+- Use `/commands` to list available project commands
+- Commands are displayed as inline buttons
+- Each `.md` file is a prompt/instruction for the AI agent
+
+Example structure:
+```
+project/
+└── .claude/
+    └── commands/
+        ├── build.md
+        ├── test.md
+        └── deploy.md
+```
 
 ### Session Management
 

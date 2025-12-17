@@ -1,6 +1,7 @@
 """Message handlers for non-command inputs."""
 
 import asyncio
+import time
 from typing import Optional
 
 import structlog
@@ -10,6 +11,7 @@ from telegram import Update
 from telegram.ext import ContextTypes
 
 from ...claude.exceptions import ClaudeToolValidationError
+from ...claude.integration import StreamUpdate
 from ...config.settings import Settings
 from ...security.audit import AuditLogger
 from ...security.rate_limiter import RateLimiter
@@ -19,23 +21,36 @@ logger = structlog.get_logger()
 tracer = trace.get_tracer("telegram.handlers")
 
 
-async def _format_progress_update(update_obj) -> Optional[str]:
+async def _format_progress_update(update_obj: "StreamUpdate") -> Optional[str]:
     """Format progress updates with enhanced context and visual indicators."""
     if update_obj.type == "tool_result":
         # Show tool completion status
-        tool_name = "Unknown"
-        if update_obj.metadata and update_obj.metadata.get("tool_use_id"):
-            # Try to extract tool name from context if available
-            tool_name = update_obj.metadata.get("tool_name", "Tool")
+        tool_name = None
+
+        # Try to extract tool name from metadata
+        if update_obj.metadata:
+            tool_name = update_obj.metadata.get("tool_name")
+
+        # Try to extract from tool_calls if metadata doesn't have it
+        if not tool_name or tool_name == "unknown":
+            if update_obj.tool_calls and len(update_obj.tool_calls) > 0:
+                tool_name = update_obj.tool_calls[0].get("name")
+
+        # Fallback to "Tool" if still unknown
+        if not tool_name or tool_name == "unknown":
+            tool_name = "Tool"
+
+        # Capitalize tool name for display (e.g., "read" -> "Read")
+        display_name = tool_name.capitalize() if tool_name else "Tool"
 
         if update_obj.is_error():
-            return f"❌ **{tool_name} failed**\n\n_{update_obj.get_error_message()}_"
+            return f"❌ **{display_name} failed**\n\n_{update_obj.get_error_message()}_"
         else:
             execution_time = ""
             if update_obj.metadata and update_obj.metadata.get("execution_time_ms"):
                 time_ms = update_obj.metadata["execution_time_ms"]
                 execution_time = f" ({time_ms}ms)"
-            return f"✅ **{tool_name} completed**{execution_time}"
+            return f"✅ **{display_name} completed**{execution_time}"
 
     elif update_obj.type == "progress":
         # Handle progress updates
@@ -82,6 +97,23 @@ async def _format_progress_update(update_obj) -> Optional[str]:
             tools_count = len(update_obj.metadata.get("tools", []))
             model = update_obj.metadata.get("model", "Claude")
             return f"🚀 **Starting {model}** with {tools_count} tools available"
+
+    elif update_obj.type == "thinking":
+        # Handle thinking updates (from cursor-agent)
+        subtype = update_obj.metadata.get("subtype") if update_obj.metadata else None
+        if subtype == "delta":
+            # For delta updates, show static thinking indicator (no content to avoid flicker)
+            return None  # Skip delta updates to prevent flickering
+        elif subtype == "completed":
+            # Optionally show thinking completion
+            return "💭 **Thinking...**"
+
+    elif update_obj.type == "tool_call":
+        # Show when a tool is starting (from cursor-agent)
+        if update_obj.metadata:
+            tool_name = update_obj.metadata.get("tool_name", "tool")
+            display_name = tool_name.capitalize() if tool_name else "Tool"
+            return f"🔧 **Running {display_name}...**"
 
     return None
 
@@ -231,11 +263,13 @@ async def handle_text_message(
             # Get existing session ID
             session_id = context.user_data.get("claude_session_id")
 
-            # Enhanced stream updates handler with progress tracking
+            # Enhanced stream updates handler with progress tracking and throttling
             last_progress_text = None  # Track last text to avoid duplicate edits
+            last_update_time = 0.0  # Throttle updates to prevent flickering
+            update_interval = 1.5  # Minimum seconds between updates
 
             async def stream_handler(update_obj):
-                nonlocal last_progress_text
+                nonlocal last_progress_text, last_update_time
                 try:
                     # Check for usage limit in stream content
                     # Handle both string and list content types
@@ -286,11 +320,22 @@ async def handle_text_message(
                             )
 
                     progress_text = await _format_progress_update(update_obj)
+
+                    # Throttle updates to prevent flickering
+                    current_time = time.time()
+                    time_since_last = current_time - last_update_time
+
+                    # Always update for important events (tool completion, errors)
+                    is_important = update_obj.type in ("tool_result", "error")
+
                     if progress_text and progress_text != last_progress_text:
-                        await progress_msg.edit_text(
-                            progress_text, parse_mode="Markdown"
-                        )
-                        last_progress_text = progress_text
+                        # Update if: important event OR enough time passed
+                        if is_important or time_since_last >= update_interval:
+                            await progress_msg.edit_text(
+                                progress_text, parse_mode="Markdown"
+                            )
+                            last_progress_text = progress_text
+                            last_update_time = current_time
                 except Exception as stream_error:
                     logger.exception(
                         "Failed to update progress message", error=str(stream_error)
