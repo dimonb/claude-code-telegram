@@ -8,25 +8,28 @@ Features:
 """
 
 import asyncio
+import glob
 import os
 import uuid
+import shutil
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Union
 
 import structlog
 from opentelemetry import trace
-from opentelemetry.trace import Status, StatusCode
-import claude_code_sdk
-from claude_code_sdk import (
-    ClaudeCodeOptions,
+from claude_agent_sdk import (
+    ClaudeSDKClient,
+    ClaudeAgentOptions,
+    query as claude_query,
     ClaudeSDKError,
     CLIConnectionError,
     CLINotFoundError,
-    Message,
     ProcessError,
+    CLIJSONDecodeError,
 )
-from claude_code_sdk.types import (
+from claude_agent_sdk.types import (
     AssistantMessage,
     ResultMessage,
     TextBlock,
@@ -36,20 +39,23 @@ from claude_code_sdk.types import (
 )
 
 from ..config.settings import Settings
+from ..security.validators import SecurityValidator
 from .exceptions import (
     ClaudeParsingError,
     ClaudeProcessError,
     ClaudeTimeoutError,
 )
+from .hooks import SecurityHooks
 
 logger = structlog.get_logger()
 tracer = trace.get_tracer("claude.sdk")
 
+# Type alias for SDK message types
+Message = Union[AssistantMessage, UserMessage, ResultMessage]
+
 
 def find_claude_cli(claude_cli_path: Optional[str] = None) -> Optional[str]:
     """Find Claude CLI in common locations."""
-    import glob
-    import shutil
 
     # First check if a specific path was provided via config or env
     if claude_cli_path:
@@ -173,11 +179,23 @@ class ClaudeSDKManager:
         )
 
         try:
-            # Build Claude Code options
-            options = ClaudeCodeOptions(
+            # Create security hooks for this request
+            security_hooks = SecurityHooks(
+                config=self.config,
+                working_directory=working_directory,
+                security_validator=SecurityValidator(
+                    approved_directory=self.config.approved_directory
+                ),
+            )
+            hooks_config = security_hooks.create_hooks_config()
+
+            # Build Claude Agent options
+            options = ClaudeAgentOptions(
                 max_turns=self.config.claude_max_turns,
                 cwd=str(working_directory),
                 allowed_tools=self.config.claude_allowed_tools,
+                permission_mode="acceptEdits",  # Auto-accept file edits
+                hooks=hooks_config,  # Security validation hooks
             )
 
             # Collect messages
@@ -275,7 +293,7 @@ class ClaudeSDKManager:
             )
             raise ClaudeTimeoutError(
                 f"Claude SDK timed out after {self.config.claude_timeout_seconds}s"
-            )
+            ) from e
 
         except CLINotFoundError as e:
             logger.exception("Claude CLI not found", error=str(e))
@@ -287,7 +305,7 @@ class ClaudeSDKManager:
                 "  2. Create a symlink: ln -s $(which claude) /usr/local/bin/claude\n"
                 "  3. Set CLAUDE_CLI_PATH environment variable"
             )
-            raise ClaudeProcessError(error_msg)
+            raise ClaudeProcessError(error_msg) from e
 
         except ProcessError as e:
             error_str = str(e)
@@ -297,7 +315,6 @@ class ClaudeSDKManager:
                 "limit reached" in error_str.lower()
                 or "usage limit" in error_str.lower()
             ):
-                import re
 
                 time_match = re.search(
                     r"resets?\s*(?:at\s*)?(\d{1,2}(?::\d{2})?\s*[apm]{0,2})",
@@ -347,8 +364,6 @@ class ClaudeSDKManager:
                 "limit reached" in error_str.lower()
                 or "usage limit" in error_str.lower()
             ):
-                import re
-
                 time_match = re.search(
                     r"resets?\s*(?:at\s*)?(\d{1,2}(?::\d{2})?\s*[apm]{0,2})",
                     error_str,
@@ -377,29 +392,34 @@ class ClaudeSDKManager:
                     f"• Use simpler requests that require less processing\n"
                     f"• Contact support if you need a higher limit"
                 )
-                raise ClaudeProcessError(user_friendly_msg)
+                raise ClaudeProcessError(user_friendly_msg) from e
 
             logger.exception("Claude SDK error", error=error_str)
-            raise ClaudeProcessError(f"Claude SDK error: {error_str}")
+            raise ClaudeProcessError(f"Claude SDK error: {error_str}") from e
 
         except RuntimeError as e:
             # Handle cancel scope errors gracefully
             error_msg = str(e)
-            if "cancel scope" in error_msg.lower() or "different task" in error_msg.lower():
+            if (
+                "cancel scope" in error_msg.lower()
+                or "different task" in error_msg.lower()
+            ):
                 logger.warning(
                     "Cancel scope error in Claude SDK (likely due to task cancellation)",
                     error=error_msg,
                 )
                 # Check if we have messages with error info
                 for msg in messages:
-                    if isinstance(msg, ResultMessage) and getattr(msg, "is_error", False):
+                    if isinstance(msg, ResultMessage) and getattr(
+                        msg, "is_error", False
+                    ):
                         result_error = getattr(msg, "result", "") or str(msg)
-                        raise ClaudeProcessError(f"Claude error: {result_error}") from None
+                        raise ClaudeProcessError(
+                            f"Claude error: {result_error}"
+                        ) from None
                 # If no result message, suppress the cancel scope error
                 # It's likely a side effect of proper cancellation
-                raise ClaudeProcessError(
-                    "Claude SDK operation was cancelled"
-                ) from None
+                raise ClaudeProcessError("Claude SDK operation was cancelled") from None
             else:
                 # Re-raise other RuntimeErrors
                 logger.exception("RuntimeError in Claude SDK")
@@ -465,72 +485,80 @@ class ClaudeSDKManager:
         text_blocks_count = 0
         assistant_messages_count = 0
 
-        # Store the async generator to properly close it on error
-        stream = None
+        # Use ClaudeSDKClient for streaming
         try:
-            # Use claude_code_sdk.query directly to allow instrumentation patching
-            stream = claude_code_sdk.query(prompt=prompt, options=options)
-            async for message in stream:
-                messages.append(message)
-                message_count += 1
+            # Create client with options
+            async with ClaudeSDKClient(options=options) as client:
+                # Send query
+                await client.query(prompt)
 
-                # Check for ResultMessage with error - handle immediately
-                if isinstance(message, ResultMessage):
-                    if getattr(message, "is_error", False):
-                        result_error = getattr(message, "result", "") or str(message)
-                        logger.warning(
-                            "Received result message with error",
-                            error=result_error,
-                            is_error=True,
-                        )
-                        # Store error info for later processing
-                        # Don't raise here - let the stream finish and handle in execute_command
-                        break  # Exit streaming loop since we got the final result
+                # Receive streaming responses
+                async for message in client.receive_response():
+                    messages.append(message)
+                    message_count += 1
 
-                # Track message types
-                if isinstance(message, AssistantMessage):
-                    assistant_messages_count += 1
-                    content = getattr(message, "content", [])
-                    if content and isinstance(content, list):
-                        for block in content:
-                            if isinstance(block, TextBlock):
-                                text_blocks_count += 1
-                            elif isinstance(block, ToolUseBlock):
-                                tool_count += 1
+                    # Check for ResultMessage with error - handle immediately
+                    if isinstance(message, ResultMessage):
+                        if getattr(message, "is_error", False):
+                            result_error = getattr(message, "result", "") or str(message)
+                            logger.warning(
+                                "Received result message with error",
+                                error=result_error,
+                                is_error=True,
+                            )
+                            # Store error info for later processing
+                            # Don't raise here - let the stream finish and handle in execute_command
+                            break  # Exit streaming loop since we got the final result
 
-                # Handle streaming callback
-                if stream_callback:
-                    try:
-                        await self._handle_stream_message(message, stream_callback)
-                    except Exception as callback_error:
-                        logger.warning(
-                            "Stream callback failed",
-                            error=str(callback_error),
-                            error_type=type(callback_error).__name__,
-                        )
+                    # Track message types
+                    if isinstance(message, AssistantMessage):
+                        assistant_messages_count += 1
+                        content = getattr(message, "content", [])
+                        if content and isinstance(content, list):
+                            for block in content:
+                                if isinstance(block, TextBlock):
+                                    text_blocks_count += 1
+                                elif isinstance(block, ToolUseBlock):
+                                    tool_count += 1
+
+                    # Handle streaming callback
+                    if stream_callback:
+                        try:
+                            await self._handle_stream_message(message, stream_callback)
+                        except Exception as callback_error:
+                            logger.warning(
+                                "Stream callback failed",
+                                error=str(callback_error),
+                                error_type=type(callback_error).__name__,
+                            )
 
         except RuntimeError as e:
             # Handle cancel scope errors gracefully
             error_msg = str(e)
-            if "cancel scope" in error_msg.lower() or "different task" in error_msg.lower():
+            if (
+                "cancel scope" in error_msg.lower()
+                or "different task" in error_msg.lower()
+            ):
                 logger.warning(
                     "Cancel scope error in streaming (likely due to task cancellation)",
                     error=error_msg,
                 )
                 # Check if we have a ResultMessage with error before re-raising
                 for msg in messages:
-                    if isinstance(msg, ResultMessage) and getattr(msg, "is_error", False):
+                    if isinstance(msg, ResultMessage) and getattr(
+                        msg, "is_error", False
+                    ):
                         result_error = getattr(msg, "result", "") or str(msg)
                         logger.warning(
                             "Found result message with error during cancel scope handling",
                             error=result_error,
                         )
-                        raise ClaudeProcessError(f"Claude error: {result_error}") from None
+                        raise ClaudeProcessError(
+                            f"Claude error: {result_error}"
+                        ) from None
                 # If no result message, raise a cancellation error
                 # This will be caught and handled properly by execute_command
-                raise ClaudeProcessError(
-                    "Claude SDK operation was cancelled"
-                ) from None
+                raise ClaudeProcessError("Claude SDK operation was cancelled") from None
             else:
                 # Re-raise other RuntimeErrors
                 raise
@@ -553,23 +581,12 @@ class ClaudeSDKManager:
             else:
                 logger.exception("Error in streaming execution")
             raise
-        finally:
-            # Properly close the async generator if it exists
-            if stream is not None:
-                try:
-                    await stream.aclose()
-                except Exception as close_error:
-                    # Ignore errors when closing - they're often cancel scope related
-                    if "cancel scope" not in str(close_error).lower():
-                        logger.debug(
-                            "Error closing stream generator",
-                            error=str(close_error),
-                        )
+        # Note: ClaudeSDKClient context manager handles cleanup automatically
 
     async def _handle_stream_message(
         self, message: Message, stream_callback: Callable[[StreamUpdate], None]
     ) -> None:
-        """Handle streaming message from claude-code-sdk."""
+        """Handle streaming message from claude-agent-sdk."""
         try:
             if isinstance(message, AssistantMessage):
                 # Extract content from assistant message
@@ -595,7 +612,7 @@ class ClaudeSDKManager:
                     await stream_callback(update)
 
                 # Check for tool calls (if available in the message structure)
-                # Note: This depends on the actual claude-code-sdk message structure
+                # Note: This depends on the actual claude-agent-sdk message structure
 
             elif isinstance(message, UserMessage):
                 content = getattr(message, "content", "")

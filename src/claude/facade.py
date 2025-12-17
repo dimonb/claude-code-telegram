@@ -331,11 +331,27 @@ class ClaudeIntegration:
                     )
                 ):
                     self._sdk_failed_count += 1
+
+                    # Extract context about what caused the error
+                    is_tool_result_error = (
+                        "tool_use_id" in error_str or "tool_result" in error_str.lower()
+                    )
+                    is_large_content = (
+                        len(error_str) > 500
+                    )  # Truncated errors suggest large content
+
                     logger.warning(
                         "Claude SDK failed with JSON/TaskGroup error, falling back to subprocess",
-                        error=error_str,
+                        error=error_str[:500],  # Truncate very long errors
                         failure_count=self._sdk_failed_count,
                         error_type=type(e).__name__,
+                        likely_cause=(
+                            "large_tool_result"
+                            if is_tool_result_error
+                            else "sdk_parsing_issue"
+                        ),
+                        is_large_content=is_large_content,
+                        hint="This typically happens with large tool outputs (HTTP responses, file reads, etc). Fallback to subprocess will handle it.",
                     )
 
                     # Use subprocess fallback

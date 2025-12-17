@@ -148,7 +148,7 @@ def configure_tracing(settings: Settings) -> None:
     # We use our custom instrumentor instead.
     AiosqliteInstrumentor().instrument(tracer_provider=tracer_provider)
 
-    # Instrument claude-code-sdk to automatically trace all SDK queries
+    # Instrument claude-agent-sdk to automatically trace all SDK queries
     # This provides low-level instrumentation of the SDK's query function
     ClaudeSDKInstrumentor().instrument(tracer_provider=tracer_provider)
 

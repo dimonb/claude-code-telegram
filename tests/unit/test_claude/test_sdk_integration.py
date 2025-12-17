@@ -3,6 +3,7 @@
 import asyncio
 import os
 from pathlib import Path
+from typing import Any, AsyncIterator, Callable, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -10,6 +11,39 @@ import pytest
 from src.claude.exceptions import ClaudeProcessError, ClaudeTimeoutError
 from src.claude.sdk_integration import ClaudeResponse, ClaudeSDKManager, StreamUpdate
 from src.config.settings import Settings
+
+
+class MockClaudeSDKClient:
+    """Mock ClaudeSDKClient for testing."""
+
+    def __init__(self, options: Any = None, message_generator: Optional[Callable] = None):
+        """Initialize mock client.
+
+        Args:
+            options: ClaudeAgentOptions (ignored in mock)
+            message_generator: Function that returns an async generator of messages
+        """
+        self.options = options
+        self.message_generator = message_generator
+        self._prompt = None
+
+    async def __aenter__(self):
+        """Enter async context manager."""
+        return self
+
+    async def __aexit__(self, *args):
+        """Exit async context manager."""
+        pass
+
+    async def query(self, prompt: str):
+        """Store the query prompt."""
+        self._prompt = prompt
+
+    async def receive_response(self) -> AsyncIterator[Any]:
+        """Yield messages from the message generator."""
+        if self.message_generator:
+            async for message in self.message_generator():
+                yield message
 
 
 class TestClaudeSDKManager:
@@ -71,10 +105,10 @@ class TestClaudeSDKManager:
 
     async def test_execute_command_success(self, sdk_manager):
         """Test successful command execution."""
-        from claude_code_sdk.types import AssistantMessage, ResultMessage, TextBlock
+        from claude_agent_sdk.types import AssistantMessage, ResultMessage, TextBlock
 
-        async def mock_query(prompt, options):
-            yield AssistantMessage(content=[TextBlock(text="Test response")])
+        async def mock_message_generator():
+            yield AssistantMessage(content=[TextBlock(text="Test response")], model="claude-sonnet-4-20250514")
             yield ResultMessage(
                 subtype="success",
                 duration_ms=1000,
@@ -86,7 +120,10 @@ class TestClaudeSDKManager:
                 result="Success",
             )
 
-        with patch("claude_code_sdk.query", side_effect=mock_query):
+        def mock_client_factory(options):
+            return MockClaudeSDKClient(options, mock_message_generator)
+
+        with patch("src.claude.sdk_integration.ClaudeSDKClient", side_effect=mock_client_factory):
             response = await sdk_manager.execute_command(
                 prompt="Test prompt",
                 working_directory=Path("/test"),
@@ -101,15 +138,15 @@ class TestClaudeSDKManager:
 
     async def test_execute_command_with_streaming(self, sdk_manager):
         """Test command execution with streaming callback."""
-        from claude_code_sdk.types import AssistantMessage, ResultMessage, TextBlock
+        from claude_agent_sdk.types import AssistantMessage, ResultMessage, TextBlock
 
         stream_updates = []
 
         async def stream_callback(update: StreamUpdate):
             stream_updates.append(update)
 
-        async def mock_query(prompt, options):
-            yield AssistantMessage(content=[TextBlock(text="Test response")])
+        async def mock_message_generator():
+            yield AssistantMessage(content=[TextBlock(text="Test response")], model="claude-sonnet-4-20250514")
             yield ResultMessage(
                 subtype="success",
                 duration_ms=1000,
@@ -121,7 +158,10 @@ class TestClaudeSDKManager:
                 result="Success",
             )
 
-        with patch("claude_code_sdk.query", side_effect=mock_query):
+        def mock_client_factory(options):
+            return MockClaudeSDKClient(options, mock_message_generator)
+
+        with patch("src.claude.sdk_integration.ClaudeSDKClient", side_effect=mock_client_factory):
             response = await sdk_manager.execute_command(
                 prompt="Test prompt",
                 working_directory=Path("/test"),
@@ -131,26 +171,29 @@ class TestClaudeSDKManager:
         assert len(stream_updates) > 0
         assert any(update.type == "assistant" for update in stream_updates)
 
-    async def test_execute_command_timeout(self, sdk_manager):
+    async def test_execute_command_timeout(self, sdk_manager, tmp_path):
         """Test command execution timeout."""
 
-        async def mock_hanging_query(prompt, options):
+        async def mock_hanging_generator():
             await asyncio.sleep(5)
             yield
 
-        with patch("claude_code_sdk.query", side_effect=mock_hanging_query):
+        def mock_client_factory(options):
+            return MockClaudeSDKClient(options, mock_hanging_generator)
+
+        with patch("src.claude.sdk_integration.ClaudeSDKClient", side_effect=mock_client_factory):
             with pytest.raises(ClaudeTimeoutError):
                 await sdk_manager.execute_command(
                     prompt="Test prompt",
-                    working_directory=Path("/test"),
+                    working_directory=tmp_path,
                 )
 
     async def test_session_management(self, sdk_manager):
         """Test session management."""
-        from claude_code_sdk.types import AssistantMessage
+        from claude_agent_sdk.types import AssistantMessage, TextBlock
 
         session_id = "test-session"
-        messages = [AssistantMessage(content="test")]
+        messages = [AssistantMessage(content=[TextBlock(text="test")], model="claude-sonnet-4-20250514")]
 
         sdk_manager._update_session(session_id, messages)
 
@@ -200,10 +243,10 @@ class TestClaudeSDKErrorHandling:
 
     async def test_limit_reached_error(self, sdk_manager):
         """Test handling of usage limit reached error."""
-        from claude_code_sdk.types import AssistantMessage, ResultMessage, TextBlock
+        from claude_agent_sdk.types import AssistantMessage, ResultMessage, TextBlock
 
-        async def mock_query(prompt, options):
-            yield AssistantMessage(content=[TextBlock(text="Processing...")])
+        async def mock_message_generator():
+            yield AssistantMessage(content=[TextBlock(text="Processing...")], model="claude-sonnet-4-20250514")
             yield ResultMessage(
                 subtype="success",
                 duration_ms=1000,
@@ -215,7 +258,10 @@ class TestClaudeSDKErrorHandling:
                 result="Limit reached · resets 8pm (Asia/Jerusalem)",
             )
 
-        with patch("claude_code_sdk.query", side_effect=mock_query):
+        def mock_client_factory(options):
+            return MockClaudeSDKClient(options, mock_message_generator)
+
+        with patch("src.claude.sdk_integration.ClaudeSDKClient", side_effect=mock_client_factory):
             with pytest.raises(ClaudeProcessError) as exc_info:
                 await sdk_manager.execute_command(
                     prompt="Test prompt",
@@ -229,9 +275,9 @@ class TestClaudeSDKErrorHandling:
 
     async def test_limit_reached_error_without_timezone(self, sdk_manager):
         """Test handling of limit reached error without timezone."""
-        from claude_code_sdk.types import ResultMessage
+        from claude_agent_sdk.types import ResultMessage
 
-        async def mock_query(prompt, options):
+        async def mock_message_generator():
             yield ResultMessage(
                 subtype="success",
                 duration_ms=1000,
@@ -243,7 +289,10 @@ class TestClaudeSDKErrorHandling:
                 result="Limit reached · resets 9am",
             )
 
-        with patch("claude_code_sdk.query", side_effect=mock_query):
+        def mock_client_factory(options):
+            return MockClaudeSDKClient(options, mock_message_generator)
+
+        with patch("src.claude.sdk_integration.ClaudeSDKClient", side_effect=mock_client_factory):
             with pytest.raises(ClaudeProcessError) as exc_info:
                 await sdk_manager.execute_command(
                     prompt="Test prompt",
@@ -256,9 +305,9 @@ class TestClaudeSDKErrorHandling:
 
     async def test_generic_error_in_result(self, sdk_manager):
         """Test handling of generic error in result message."""
-        from claude_code_sdk.types import ResultMessage
+        from claude_agent_sdk.types import ResultMessage
 
-        async def mock_query(prompt, options):
+        async def mock_message_generator():
             yield ResultMessage(
                 subtype="error",
                 duration_ms=500,
@@ -270,7 +319,10 @@ class TestClaudeSDKErrorHandling:
                 result="Some unexpected error occurred",
             )
 
-        with patch("claude_code_sdk.query", side_effect=mock_query):
+        def mock_client_factory(options):
+            return MockClaudeSDKClient(options, mock_message_generator)
+
+        with patch("src.claude.sdk_integration.ClaudeSDKClient", side_effect=mock_client_factory):
             with pytest.raises(ClaudeProcessError) as exc_info:
                 await sdk_manager.execute_command(
                     prompt="Test prompt",
@@ -282,9 +334,9 @@ class TestClaudeSDKErrorHandling:
 
     async def test_empty_error_in_result(self, sdk_manager):
         """Test handling of empty error in result message."""
-        from claude_code_sdk.types import ResultMessage
+        from claude_agent_sdk.types import ResultMessage
 
-        async def mock_query(prompt, options):
+        async def mock_message_generator():
             yield ResultMessage(
                 subtype="error",
                 duration_ms=500,
@@ -296,7 +348,10 @@ class TestClaudeSDKErrorHandling:
                 result="",
             )
 
-        with patch("claude_code_sdk.query", side_effect=mock_query):
+        def mock_client_factory(options):
+            return MockClaudeSDKClient(options, mock_message_generator)
+
+        with patch("src.claude.sdk_integration.ClaudeSDKClient", side_effect=mock_client_factory):
             with pytest.raises(ClaudeProcessError) as exc_info:
                 await sdk_manager.execute_command(
                     prompt="Test prompt",
@@ -307,12 +362,12 @@ class TestClaudeSDKErrorHandling:
 
     async def test_json_decode_error_with_result_error(self, sdk_manager):
         """Test that result error takes precedence over JSON decode error."""
-        from claude_code_sdk.types import ResultMessage
-        from claude_code_sdk._errors import CLIJSONDecodeError
+        from claude_agent_sdk.types import ResultMessage
+        from claude_agent_sdk._errors import CLIJSONDecodeError
 
         messages_received = []
 
-        async def mock_query(prompt, options):
+        async def mock_message_generator():
             msg = ResultMessage(
                 subtype="success",
                 duration_ms=1000,
@@ -327,7 +382,10 @@ class TestClaudeSDKErrorHandling:
             yield msg
             raise CLIJSONDecodeError("invalid json", Exception("Extra data"))
 
-        with patch("claude_code_sdk.query", side_effect=mock_query):
+        def mock_client_factory(options):
+            return MockClaudeSDKClient(options, mock_message_generator)
+
+        with patch("src.claude.sdk_integration.ClaudeSDKClient", side_effect=mock_client_factory):
             with pytest.raises(ClaudeProcessError) as exc_info:
                 await sdk_manager.execute_command(
                     prompt="Test prompt",
@@ -339,9 +397,9 @@ class TestClaudeSDKErrorHandling:
 
     async def test_exception_group_with_result_error(self, sdk_manager):
         """Test handling of ExceptionGroup when result has error."""
-        from claude_code_sdk.types import ResultMessage
+        from claude_agent_sdk.types import ResultMessage
 
-        async def mock_query(prompt, options):
+        async def mock_message_generator():
             yield ResultMessage(
                 subtype="success",
                 duration_ms=1000,
@@ -354,7 +412,10 @@ class TestClaudeSDKErrorHandling:
             )
             raise ExceptionGroup("test errors", [ValueError("inner error")])
 
-        with patch("claude_code_sdk.query", side_effect=mock_query):
+        def mock_client_factory(options):
+            return MockClaudeSDKClient(options, mock_message_generator)
+
+        with patch("src.claude.sdk_integration.ClaudeSDKClient", side_effect=mock_client_factory):
             with pytest.raises(ClaudeProcessError) as exc_info:
                 await sdk_manager.execute_command(
                     prompt="Test prompt",
@@ -368,11 +429,14 @@ class TestClaudeSDKErrorHandling:
         """Test that ClaudeProcessError is not double-wrapped."""
         original_error = ClaudeProcessError("Original error message")
 
-        async def mock_query(prompt, options):
+        async def mock_message_generator():
             raise original_error
             yield
 
-        with patch("claude_code_sdk.query", side_effect=mock_query):
+        def mock_client_factory(options):
+            return MockClaudeSDKClient(options, mock_message_generator)
+
+        with patch("src.claude.sdk_integration.ClaudeSDKClient", side_effect=mock_client_factory):
             with pytest.raises(ClaudeProcessError) as exc_info:
                 await sdk_manager.execute_command(
                     prompt="Test prompt",

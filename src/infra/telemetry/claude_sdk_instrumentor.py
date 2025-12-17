@@ -1,6 +1,6 @@
-"""OpenTelemetry instrumentation for claude-code-sdk.
+"""OpenTelemetry instrumentation for claude-agent-sdk.
 
-This instrumentor wraps the claude_code_sdk.query function to automatically
+This instrumentor wraps the claude_agent_sdk.query function to automatically
 capture spans for all SDK calls, including tool usage, streaming messages,
 and error conditions.
 """
@@ -15,7 +15,7 @@ from opentelemetry.trace import Status, StatusCode
 
 
 class ClaudeSDKInstrumentor:
-    """OpenTelemetry instrumentor for claude-code-sdk."""
+    """OpenTelemetry instrumentor for claude-agent-sdk."""
 
     _instance = None
     _instrumented = False
@@ -28,7 +28,7 @@ class ClaudeSDKInstrumentor:
         return cls._instance
 
     def instrument(self, tracer_provider=None) -> None:
-        """Instrument claude-code-sdk.query function.
+        """Instrument claude-agent-sdk.query function.
 
         Args:
             tracer_provider: Optional tracer provider (for compatibility with other instrumentors).
@@ -37,16 +37,17 @@ class ClaudeSDKInstrumentor:
             return
 
         try:
-            import claude_code_sdk
+            import claude_agent_sdk
 
             # Store reference to original function BEFORE any patching
-            original_query = claude_code_sdk.query
+            original_query = claude_agent_sdk.query
             self._original_query = original_query
 
-            from claude_code_sdk.types import (
+            from claude_agent_sdk.types import (
                 AssistantMessage,
                 ResultMessage,
                 TextBlock,
+                ToolResultBlock,
                 ToolUseBlock,
             )
 
@@ -54,30 +55,30 @@ class ClaudeSDKInstrumentor:
             async def instrumented_query(
                 prompt: str, options: Any = None, **kwargs: Any
             ) -> AsyncIterator[Any]:
-                """Instrumented version of claude_code_sdk.query."""
+                """Instrumented version of claude_agent_sdk.query."""
                 # Create span manually (not as context manager) to avoid
                 # context issues when generator is interrupted (GeneratorExit)
                 tracer = trace.get_tracer(__name__)
-                sdk_span = tracer.start_span("claude_code_sdk.query")
+                sdk_span = tracer.start_span("claude_agent_sdk.query")
 
-                sdk_span.set_attribute("claude_code_sdk.prompt_length", len(prompt))
+                sdk_span.set_attribute("claude_agent_sdk.prompt_length", len(prompt))
                 # Add prompt text (truncated if too long)
                 prompt_text = prompt[:1000] + (
                     "... (truncated)" if len(prompt) > 1000 else ""
                 )
-                sdk_span.set_attribute("claude_code_sdk.prompt", prompt_text)
+                sdk_span.set_attribute("claude_agent_sdk.prompt", prompt_text)
 
                 if options:
                     cwd = getattr(options, "cwd", None)
                     if cwd:
-                        sdk_span.set_attribute("claude_code_sdk.cwd", str(cwd))
+                        sdk_span.set_attribute("claude_agent_sdk.cwd", str(cwd))
                     max_turns = getattr(options, "max_turns", None)
                     if max_turns:
-                        sdk_span.set_attribute("claude_code_sdk.max_turns", max_turns)
+                        sdk_span.set_attribute("claude_agent_sdk.max_turns", max_turns)
                     allowed_tools = getattr(options, "allowed_tools", None)
                     if allowed_tools:
                         sdk_span.set_attribute(
-                            "claude_code_sdk.allowed_tools",
+                            "claude_agent_sdk.allowed_tools",
                             (
                                 ",".join(allowed_tools)
                                 if isinstance(allowed_tools, list)
@@ -91,11 +92,13 @@ class ClaudeSDKInstrumentor:
                 text_blocks_count = 0
                 total_cost = 0.0
                 response_text_parts = []
+                # Track active tool spans to add results later
+                active_tool_spans = {}
 
                 try:
                     # Use sdk_span as the parent context for all child spans
                     with trace.use_span(sdk_span):
-                        # claude_code_sdk.query requires keyword-only arguments
+                        # claude_agent_sdk.query requires keyword-only arguments
                         async for message in original_query(
                             prompt=prompt, options=options, **kwargs
                         ):
@@ -115,41 +118,86 @@ class ClaudeSDKInstrumentor:
                                                 response_text_parts.append(text)
                                         elif isinstance(block, ToolUseBlock):
                                             tool_count += 1
+                                            tool_id = getattr(block, "id", None)
                                             tool_name = getattr(
-                                                block, "tool_name", "unknown"
+                                                block, "name", "unknown"
                                             )
                                             # Create a child span for each tool call
-                                            # This makes tool calls visible in traces
-                                            with tracer.start_as_current_span(
+                                            # Keep it open until we get the result
+                                            tool_span = tracer.start_span(
                                                 f"tool.{tool_name}"
-                                            ) as tool_span:
-                                                tool_span.set_attribute("tool.name", tool_name)
-                                                tool_input = getattr(block, "tool_input", {})
+                                            )
+                                            tool_span.set_attribute(
+                                                "tool_name", tool_name
+                                            )
+                                            tool_input = getattr(block, "input", {})
+                                            tool_span.set_attribute(
+                                                "tool_input",
+                                                str(tool_input)[:500],
+                                            )
+                                            if tool_id:
                                                 tool_span.set_attribute(
-                                                    "tool.input",
-                                                    str(tool_input)[:500],
+                                                    "tool_id", tool_id
                                                 )
-                                                # The span will be automatically ended when exiting the context
+                                                # Store span to add result later
+                                                active_tool_spans[tool_id] = tool_span
+                                            else:
+                                                # No ID, can't match result - end immediately
+                                                tool_span.end()
+                                        elif isinstance(block, ToolResultBlock):
+                                            # Match result to tool span
+                                            tool_use_id = getattr(
+                                                block, "tool_use_id", None
+                                            )
+                                            if (
+                                                tool_use_id
+                                                and tool_use_id in active_tool_spans
+                                            ):
+                                                tool_span = active_tool_spans.pop(
+                                                    tool_use_id
+                                                )
+                                                # Add result to span
+                                                content = getattr(block, "content", "")
+                                                is_error = getattr(
+                                                    block, "is_error", False
+                                                )
+                                                if content:
+                                                    tool_span.set_attribute(
+                                                        "tool_result",
+                                                        str(content)[:1000],
+                                                    )
+                                                tool_span.set_attribute(
+                                                    "tool_is_error", bool(is_error)
+                                                )
+                                                if is_error:
+                                                    tool_span.set_status(
+                                                        Status(
+                                                            StatusCode.ERROR,
+                                                            description="Tool execution failed",
+                                                        )
+                                                    )
+                                                # End the tool span now that we have the result
+                                                tool_span.end()
 
                             elif isinstance(message, ResultMessage):
                                 cost = getattr(message, "total_cost_usd", None)
                                 if cost is not None:
                                     total_cost = float(cost) or 0.0
                                     sdk_span.set_attribute(
-                                        "claude_code_sdk.cost_usd", total_cost
+                                        "claude_agent_sdk.cost_usd", total_cost
                                     )
 
                     # Normal completion - set final attributes
                     sdk_span.set_attribute(
-                        "claude_code_sdk.message_count", message_count
+                        "claude_agent_sdk.message_count", message_count
                     )
                     sdk_span.set_attribute(
-                        "claude_code_sdk.assistant_messages_count",
+                        "claude_agent_sdk.assistant_messages_count",
                         assistant_messages_count,
                     )
-                    sdk_span.set_attribute("claude_code_sdk.tool_count", tool_count)
+                    sdk_span.set_attribute("claude_agent_sdk.tool_count", tool_count)
                     sdk_span.set_attribute(
-                        "claude_code_sdk.text_blocks_count", text_blocks_count
+                        "claude_agent_sdk.text_blocks_count", text_blocks_count
                     )
                     if response_text_parts:
                         response_text = "".join(response_text_parts)
@@ -159,48 +207,124 @@ class ClaudeSDKInstrumentor:
                             else response_text
                         )
                         sdk_span.set_attribute(
-                            "claude_code_sdk.response_text", response_text_attr
+                            "claude_agent_sdk.response_text", response_text_attr
                         )
 
                 except GeneratorExit:
                     # Generator closed by consumer - mark as interrupted, not error
                     sdk_span.set_attribute(
-                        "claude_code_sdk.generator_interrupted", True
+                        "claude_agent_sdk.generator_interrupted", True
                     )
                     sdk_span.set_attribute(
-                        "claude_code_sdk.message_count", message_count
+                        "claude_agent_sdk.message_count", message_count
                     )
+                    # End any active tool spans before re-raising
+                    for tool_id, tool_span in active_tool_spans.items():
+                        with contextlib.suppress(ValueError, RuntimeError):
+                            tool_span.set_attribute("tool_result_missing", True)
+                            tool_span.set_attribute("interrupted", True)
+                            tool_span.end()
+                    active_tool_spans.clear()
                     raise
 
                 except Exception as e:
                     sdk_span.record_exception(e)
-                    sdk_span.set_status(Status(StatusCode.ERROR, description=str(e)))
-                    error_str = str(e).lower()
-                    if "limit reached" in error_str or "usage limit" in error_str:
-                        sdk_span.set_attribute(
-                            "claude_code_sdk.error_type", "usage_limit_reached"
+                    error_str = str(e)
+                    error_str_lower = error_str.lower()
+
+                    # Check if this is a JSON decode error (will trigger fallback)
+                    is_json_error = (
+                        "json" in error_str_lower
+                        and (
+                            "decode" in error_str_lower or "parsing" in error_str_lower
                         )
+                    ) or "unterminated string" in error_str_lower
+
+                    if (
+                        "limit reached" in error_str_lower
+                        or "usage limit" in error_str_lower
+                    ):
+                        sdk_span.set_attribute(
+                            "claude_agent_sdk.error_type", "usage_limit_reached"
+                        )
+                        sdk_span.set_status(
+                            Status(StatusCode.ERROR, description=str(e))
+                        )
+                    elif is_json_error:
+                        # JSON decode errors trigger fallback, not real errors
+                        sdk_span.set_attribute(
+                            "claude_agent_sdk.error_type", "json_decode_will_fallback"
+                        )
+                        sdk_span.set_attribute(
+                            "claude_agent_sdk.fallback_triggered", True
+                        )
+                        # Don't mark as ERROR - this will be retried via subprocess
+                        sdk_span.set_status(
+                            Status(
+                                StatusCode.OK,
+                                description="SDK failed, will retry via subprocess",
+                            )
+                        )
+                    else:
+                        sdk_span.set_status(
+                            Status(StatusCode.ERROR, description=str(e))
+                        )
+
+                    # End any active tool spans
+                    for tool_id, tool_span in active_tool_spans.items():
+                        with contextlib.suppress(ValueError, RuntimeError):
+                            if is_json_error:
+                                # JSON error - mark for fallback, not as error
+                                tool_span.set_attribute("sdk_incomplete", True)
+                                tool_span.set_attribute(
+                                    "sdk_incomplete_reason", "json_decode_error"
+                                )
+                                tool_span.set_attribute(
+                                    "note",
+                                    "SDK failed with JSON error, operation retried via subprocess",
+                                )
+                                # Don't mark as error since fallback will complete it
+                                tool_span.set_status(
+                                    Status(
+                                        StatusCode.OK,
+                                        description="Retried via subprocess fallback",
+                                    )
+                                )
+                            else:
+                                # Real error
+                                tool_span.set_attribute("tool_result_missing", True)
+                                tool_span.set_status(
+                                    Status(StatusCode.ERROR, description="SDK error")
+                                )
+                            tool_span.end()
+                    active_tool_spans.clear()
                     raise
 
                 finally:
+                    # End any remaining tool spans that never got results
+                    for tool_id, tool_span in active_tool_spans.items():
+                        with contextlib.suppress(ValueError, RuntimeError):
+                            tool_span.set_attribute("tool_result_missing", True)
+                            tool_span.end()
+
                     # Always end the span, suppressing context detach errors
                     # that can occur when generator is interrupted across tasks
                     with contextlib.suppress(ValueError, RuntimeError):
                         sdk_span.end()
 
             # Patch the module - this will affect future imports
-            claude_code_sdk.query = instrumented_query
+            claude_agent_sdk.query = instrumented_query
 
             # Also patch in sys.modules to catch already-imported references
-            if "claude_code_sdk" in sys.modules:
-                sys.modules["claude_code_sdk"].query = instrumented_query
+            if "claude_agent_sdk" in sys.modules:
+                sys.modules["claude_agent_sdk"].query = instrumented_query
 
             # Store reference to instrumented query for delayed patching
             self._instrumented_query = instrumented_query
 
             # CRITICAL: Patch already-imported modules that imported query directly
             # This handles the case where sdk_integration.py does:
-            # `from claude_code_sdk import query`
+            # `from claude_agent_sdk import query`
             # which creates a local reference before our patch
             self._patch_imported_modules(original_query, instrumented_query)
 
@@ -247,7 +371,7 @@ class ClaudeSDKInstrumentor:
         self._patch_imported_modules(self._original_query, self._instrumented_query)
 
     def uninstrument(self) -> None:
-        """Uninstrument claude-code-sdk."""
+        """Uninstrument claude-agent-sdk."""
         if not self._instrumented:
             return
 

@@ -134,19 +134,25 @@ src/
 
 ### Claude Integration Modes
 
-The bot supports two Claude integration modes:
+The bot supports two Claude integration modes with automatic fallback:
 
 1. **SDK Mode** (default, `USE_SDK=true`)
-   - Uses `claude-code-sdk` Python package
+   - Uses `claude-agent-sdk` Python package (v0.1.17+)
    - Direct API integration with streaming support
    - Implemented in `claude/sdk_integration.py`
    - Requires CLI authentication OR `ANTHROPIC_API_KEY`
+   - Uses SDK-native security hooks for tool validation
+   - **Known Issue:** Large tool outputs (>50KB) can cause JSON parsing errors
+   - Automatically falls back to subprocess mode on parse errors
 
 2. **CLI Subprocess Mode** (`USE_SDK=false`)
    - Spawns Claude CLI as subprocess
-   - Legacy fallback mechanism
+   - Fallback mechanism when SDK fails
    - Implemented in `claude/integration.py`
    - Requires Claude CLI installed and authenticated
+   - More stable with very large tool outputs
+
+**Automatic Fallback:** When SDK mode fails with JSON decode errors (typically from large HTTP responses, file reads, or grep results), the system automatically falls back to subprocess mode. This is expected behavior and logged at WARNING level.
 
 ### Session Management
 
@@ -283,7 +289,7 @@ Dependencies are managed by Poetry in `pyproject.toml`:
 **Core Runtime:**
 - `python-telegram-bot`: Telegram bot framework
 - `anthropic`: Anthropic API client
-- `claude-code-sdk`: Claude Code SDK
+- `claude-agent-sdk`: Claude Agent SDK (v0.1.17+)
 - `pydantic`: Configuration and validation
 - `structlog`: Structured logging
 - `aiosqlite`: Async SQLite
