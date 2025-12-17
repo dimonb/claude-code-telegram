@@ -551,6 +551,8 @@ class CursorAgentManager:
         tool_result = None
         mcp_provider = None
         mcp_tool_name = None
+        error_message = None
+        is_error = False
 
         # Try to extract tool name from tool_call_data
         for tool_type in TOOL_CALL_TYPES:
@@ -696,7 +698,6 @@ class CursorAgentManager:
                     )
 
                 # Add result and output to span
-                is_error = False
                 if tool_result:
                     import json as json_module
 
@@ -731,6 +732,8 @@ class CursorAgentManager:
 
                             span.set_attribute("tool.mcp.is_error", is_error)
                             span.set_attribute("tool.status", "error" if is_error else "success")
+                            if is_error and not error_message:
+                                error_message = success_data.get("message") or (mcp_output if text_parts else None)
 
                             # Serialize full MCP result
                             try:
@@ -754,6 +757,8 @@ class CursorAgentManager:
                             # Check if result contains error indicators
                             if any(err in tool_result.lower() for err in ["error:", "failed:", "exception:"]):
                                 is_error = True
+                                if not error_message:
+                                    error_message = tool_result
                         elif isinstance(tool_result, (int, float, bool, type(None))):
                             # Simple types
                             span.set_attribute("tool.output", str(tool_result))
@@ -767,11 +772,14 @@ class CursorAgentManager:
                                 span.set_attribute("tool.error", error_msg)
                                 span.set_attribute("tool.validation_error", error_msg)
                                 is_error = True
+                                error_message = error_message or error_msg
                             if "status" in tool_result:
                                 status = tool_result["status"]
                                 span.set_attribute("tool.status", str(status))
                                 if status in ["error", "failed", "rejected"]:
                                     is_error = True
+                                    if not error_message:
+                                        error_message = str(tool_result.get("error") or status)
 
                             # Serialize full result as JSON
                             try:
@@ -833,14 +841,23 @@ class CursorAgentManager:
         # Use tool_result or tool_call type for update type
         update_type = "tool_result" if subtype == "completed" else "tool_call"
 
+        metadata = {
+            "subtype": subtype,
+            "call_id": call_id,
+            "tool_use_id": call_id,  # Alias for compatibility with message.py
+            "tool_name": tool_name or "unknown",
+        }
+        if tool_args:
+            metadata["tool_args"] = tool_args
+        if subtype == "completed":
+            metadata["status"] = "error" if is_error else "success"
+            metadata["is_error"] = is_error
+        else:
+            metadata["status"] = "running"
+
         return StreamUpdate(
             type=update_type,
-            metadata={
-                "subtype": subtype,
-                "call_id": call_id,
-                "tool_use_id": call_id,  # Alias for compatibility with message.py
-                "tool_name": tool_name or "unknown",
-            },
+            metadata=metadata,
             tool_calls=(
                 [
                     {
@@ -855,6 +872,7 @@ class CursorAgentManager:
             ),
             timestamp=str(msg.get("timestamp_ms", "")),
             session_context={"session_id": msg.get("session_id")},
+            error_info={"message": error_message} if error_message else None,
         )
 
     def _parse_result(

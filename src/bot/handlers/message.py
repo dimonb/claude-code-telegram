@@ -1,6 +1,7 @@
 """Message handlers for non-command inputs."""
 
 import asyncio
+import json
 import time
 from typing import Optional
 
@@ -48,11 +49,19 @@ def _format_tool_params(params: dict, max_length: int = 50) -> str:
             if len(value) > 30:
                 value = value[:30] + "..."
             parts.append(f"{key}=\"{value}\"")
-        elif isinstance(value, (int, float, bool)):
+        elif isinstance(value, (int, float, bool)) or value is None:
             parts.append(f"{key}={value}")
         else:
-            # For complex types, just show the type
-            parts.append(f"{key}={type(value).__name__}")
+            # For complex types, try to serialize to JSON for readability
+            try:
+                serialized = json.dumps(value)
+            except Exception:
+                serialized = str(value) if value is not None else "null"
+
+            if len(serialized) > 30:
+                serialized = serialized[:30] + "..."
+
+            parts.append(f"{key}={serialized}")
 
     params_str = ", ".join(parts)
     if len(params_str) > max_length:
@@ -82,7 +91,9 @@ def _format_progress_update(
                 tool_name = _format_tool_name(entry["name"])
                 params_str = _format_tool_params(entry["params"])
                 icon = entry["icon"]
-                journal_lines.append(f"{icon} {tool_name}{params_str}")
+                status_text = entry.get("status")
+                status_suffix = f" [{status_text}]" if status_text else ""
+                journal_lines.append(f"{icon} {tool_name}{params_str}{status_suffix}")
 
     # Format the journal
     journal_text = ""
@@ -390,15 +401,18 @@ async def handle_text_message(
                     # Track tool calls in journal
                     if update_obj.type == "tool_call":
                         # Tool started
-                        call_id = update_obj.metadata.get("call_id") if update_obj.metadata else None
-                        tool_name = update_obj.metadata.get("tool_name", "tool") if update_obj.metadata else "tool"
+                        metadata = update_obj.metadata or {}
+                        call_id = metadata.get("call_id") or metadata.get("tool_use_id")
+                        tool_name = metadata.get("tool_name", "tool")
 
-                        # Extract parameters from tool_calls
+                        # Extract parameters from tool_calls or metadata fallback
                         params = {}
                         if update_obj.tool_calls and len(update_obj.tool_calls) > 0:
                             tool_call = update_obj.tool_calls[0]
                             tool_name = tool_call.get("name", tool_name)
                             params = tool_call.get("input", {})
+                        if not params:
+                            params = metadata.get("tool_args", {})
 
                         if call_id:
                             tool_journal[call_id] = {
@@ -407,7 +421,8 @@ async def handle_text_message(
                                 "status": "running",
                                 "icon": "⏳"
                             }
-                            tool_order.append(call_id)
+                            if call_id not in tool_order:
+                                tool_order.append(call_id)
                             logger.debug(
                                 "Tool started, added to journal",
                                 call_id=call_id,
@@ -417,15 +432,37 @@ async def handle_text_message(
 
                     elif update_obj.type == "tool_result":
                         # Tool completed
-                        call_id = update_obj.metadata.get("call_id") if update_obj.metadata else None
-                        if call_id and call_id in tool_journal:
-                            is_error = update_obj.is_error()
-                            tool_journal[call_id]["status"] = "error" if is_error else "success"
-                            tool_journal[call_id]["icon"] = "❌" if is_error else "✅"
+                        metadata = update_obj.metadata or {}
+                        call_id = metadata.get("call_id") or metadata.get("tool_use_id")
+                        if call_id:
+                            existing_entry = tool_journal.get(call_id, {})
+                            params = existing_entry.get("params", {})
+                            tool_name = existing_entry.get("name", metadata.get("tool_name", "tool"))
+
+                            # Keep args/name up to date if completion carries details
+                            if update_obj.tool_calls and len(update_obj.tool_calls) > 0:
+                                tool_call = update_obj.tool_calls[0]
+                                tool_name = tool_call.get("name", tool_name)
+                                params = tool_call.get("input", params or {})
+                            if not params:
+                                params = metadata.get("tool_args", params)
+
+                            is_error = update_obj.is_error() or metadata.get("status") == "error"
+
+                            tool_journal[call_id] = {
+                                "name": tool_name,
+                                "params": params,
+                                "status": "error" if is_error else "success",
+                                "icon": "❌" if is_error else "✅",
+                            }
+
+                            if call_id not in tool_order:
+                                tool_order.append(call_id)
+
                             logger.debug(
                                 "Tool completed, updated in journal",
                                 call_id=call_id,
-                                tool_name=tool_journal[call_id]["name"],
+                                tool_name=tool_name,
                                 is_error=is_error
                             )
 
