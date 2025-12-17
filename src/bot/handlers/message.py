@@ -21,8 +21,74 @@ logger = structlog.get_logger()
 tracer = trace.get_tracer("telegram.handlers")
 
 
-async def _format_progress_update(update_obj: "StreamUpdate") -> Optional[str]:
+def _format_tool_name(tool_name: str) -> str:
+    """Format tool name for display."""
+    # Handle MCP tools: mcp_provider_toolname -> Provider:ToolName
+    if tool_name.startswith("mcp_"):
+        parts = tool_name.split("_", 2)
+        if len(parts) >= 3:
+            provider = parts[1].replace("-", " ").title()
+            name = parts[2].replace("_", " ").replace("-", " ").title()
+            return f"{provider}:{name}"
+
+    # Regular tools: capitalize
+    return tool_name.replace("_", " ").title()
+
+
+def _format_tool_params(params: dict, max_length: int = 50) -> str:
+    """Format tool parameters compactly."""
+    if not params:
+        return "()"
+
+    # Format key-value pairs
+    parts = []
+    for key, value in params.items():
+        # Truncate long values
+        if isinstance(value, str):
+            if len(value) > 30:
+                value = value[:30] + "..."
+            parts.append(f"{key}=\"{value}\"")
+        elif isinstance(value, (int, float, bool)):
+            parts.append(f"{key}={value}")
+        else:
+            # For complex types, just show the type
+            parts.append(f"{key}={type(value).__name__}")
+
+    params_str = ", ".join(parts)
+    if len(params_str) > max_length:
+        params_str = params_str[:max_length] + "..."
+
+    return f"({params_str})"
+
+
+def _format_progress_update(
+    update_obj: "StreamUpdate",
+    tool_journal: dict = None,
+    tool_order: list = None
+) -> Optional[str]:
     """Format progress updates with enhanced context and visual indicators."""
+    # Build tool journal section if we have tools
+    journal_lines = []
+    if tool_journal and tool_order:
+        logger.debug(
+            "Formatting progress with tool journal",
+            update_type=update_obj.type,
+            journal_size=len(tool_journal),
+            tools_count=len(tool_order)
+        )
+        for call_id in tool_order:
+            if call_id in tool_journal:
+                entry = tool_journal[call_id]
+                tool_name = _format_tool_name(entry["name"])
+                params_str = _format_tool_params(entry["params"])
+                icon = entry["icon"]
+                journal_lines.append(f"{icon} {tool_name}{params_str}")
+
+    # Format the journal
+    journal_text = ""
+    if journal_lines:
+        journal_text = "\n".join(journal_lines) + "\n\n"
+
     if update_obj.type == "tool_result":
         # Show tool completion status
         tool_name = None
@@ -40,17 +106,16 @@ async def _format_progress_update(update_obj: "StreamUpdate") -> Optional[str]:
         if not tool_name or tool_name == "unknown":
             tool_name = "Tool"
 
-        # Capitalize tool name for display (e.g., "read" -> "Read")
-        display_name = tool_name.capitalize() if tool_name else "Tool"
+        # For tool_result, just return the journal (status already updated in journal)
+        if journal_text:
+            return journal_text + "🤔 Processing..."
 
+        # Fallback if no journal
+        display_name = tool_name.capitalize() if tool_name else "Tool"
         if update_obj.is_error():
             return f"❌ **{display_name} failed**\n\n_{update_obj.get_error_message()}_"
         else:
-            execution_time = ""
-            if update_obj.metadata and update_obj.metadata.get("execution_time_ms"):
-                time_ms = update_obj.metadata["execution_time_ms"]
-                execution_time = f" ({time_ms}ms)"
-            return f"✅ **{display_name} completed**{execution_time}"
+            return f"✅ **{display_name} completed**"
 
     elif update_obj.type == "progress":
         # Handle progress updates
@@ -69,18 +134,15 @@ async def _format_progress_update(update_obj: "StreamUpdate") -> Optional[str]:
             if step and total_steps:
                 progress_text += f"\n\nStep {step} of {total_steps}"
 
-        return progress_text
+        return journal_text + progress_text
 
     elif update_obj.type == "error":
         # Handle error messages
-        return f"❌ **Error**\n\n_{update_obj.get_error_message()}_"
+        return journal_text + f"❌ **Error**\n\n_{update_obj.get_error_message()}_"
 
     elif update_obj.type == "assistant" and update_obj.tool_calls:
-        # Show when tools are being called
-        tool_names = update_obj.get_tool_names()
-        if tool_names:
-            tools_text = ", ".join(tool_names)
-            return f"🔧 **Using tools:** {tools_text}"
+        # Tool calls are already shown in journal, just show working status
+        return journal_text + "🤔 Processing..."
 
     elif update_obj.type == "assistant" and update_obj.content:
         # Regular content updates with preview
@@ -89,7 +151,7 @@ async def _format_progress_update(update_obj: "StreamUpdate") -> Optional[str]:
             if len(update_obj.content) > 150
             else update_obj.content
         )
-        return f"🤖 **Claude is working...**\n\n_{content_preview}_"
+        return journal_text + f"🤖 **Claude is working...**\n\n_{content_preview}_"
 
     elif update_obj.type == "system":
         # System initialization or other system messages
@@ -105,15 +167,16 @@ async def _format_progress_update(update_obj: "StreamUpdate") -> Optional[str]:
             # For delta updates, show static thinking indicator (no content to avoid flicker)
             return None  # Skip delta updates to prevent flickering
         elif subtype == "completed":
-            # Optionally show thinking completion
-            return "💭 **Thinking...**"
+            # Show journal with thinking
+            return journal_text + "💭 **Thinking...**"
 
     elif update_obj.type == "tool_call":
-        # Show when a tool is starting (from cursor-agent)
-        if update_obj.metadata:
-            tool_name = update_obj.metadata.get("tool_name", "tool")
-            display_name = tool_name.capitalize() if tool_name else "Tool"
-            return f"🔧 **Running {display_name}...**"
+        # Tool started - show journal with running status
+        return journal_text + "🤔 Processing..."
+
+    # Default: just show journal if we have it
+    if journal_text:
+        return journal_text + "🤔 Processing..."
 
     return None
 
@@ -268,8 +331,13 @@ async def handle_text_message(
             last_update_time = 0.0  # Throttle updates to prevent flickering
             update_interval = 1.5  # Minimum seconds between updates
 
+            # Tool execution journal: {call_id: {"name": str, "params": dict, "status": str, "icon": str}}
+            tool_journal = {}
+            # Order of tool calls for display
+            tool_order = []
+
             async def stream_handler(update_obj):
-                nonlocal last_progress_text, last_update_time
+                nonlocal last_progress_text, last_update_time, tool_journal, tool_order
                 try:
                     # Check for usage limit in stream content
                     # Handle both string and list content types
@@ -319,7 +387,49 @@ async def handle_text_message(
                                 )
                             )
 
-                    progress_text = await _format_progress_update(update_obj)
+                    # Track tool calls in journal
+                    if update_obj.type == "tool_call":
+                        # Tool started
+                        call_id = update_obj.metadata.get("call_id") if update_obj.metadata else None
+                        tool_name = update_obj.metadata.get("tool_name", "tool") if update_obj.metadata else "tool"
+
+                        # Extract parameters from tool_calls
+                        params = {}
+                        if update_obj.tool_calls and len(update_obj.tool_calls) > 0:
+                            tool_call = update_obj.tool_calls[0]
+                            tool_name = tool_call.get("name", tool_name)
+                            params = tool_call.get("input", {})
+
+                        if call_id:
+                            tool_journal[call_id] = {
+                                "name": tool_name,
+                                "params": params,
+                                "status": "running",
+                                "icon": "⏳"
+                            }
+                            tool_order.append(call_id)
+                            logger.debug(
+                                "Tool started, added to journal",
+                                call_id=call_id,
+                                tool_name=tool_name,
+                                journal_size=len(tool_journal)
+                            )
+
+                    elif update_obj.type == "tool_result":
+                        # Tool completed
+                        call_id = update_obj.metadata.get("call_id") if update_obj.metadata else None
+                        if call_id and call_id in tool_journal:
+                            is_error = update_obj.is_error()
+                            tool_journal[call_id]["status"] = "error" if is_error else "success"
+                            tool_journal[call_id]["icon"] = "❌" if is_error else "✅"
+                            logger.debug(
+                                "Tool completed, updated in journal",
+                                call_id=call_id,
+                                tool_name=tool_journal[call_id]["name"],
+                                is_error=is_error
+                            )
+
+                    progress_text = _format_progress_update(update_obj, tool_journal, tool_order)
 
                     # Throttle updates to prevent flickering
                     current_time = time.time()
