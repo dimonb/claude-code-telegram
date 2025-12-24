@@ -623,191 +623,253 @@ async def handle_text_message(
                         "Failed to update progress message", error=str(stream_error)
                     )
 
-            # Run Claude command
-            claude_response = None  # Initialize to avoid NameError in exception handler
-            try:
-                claude_response = await claude_integration.run_command(
-                    prompt=message_text,
-                    working_directory=current_dir,
-                    user_id=user_id,
-                    session_id=session_id,
-                    on_stream=stream_handler,
-                )
-
-                # Update session ID
-                context.user_data["claude_session_id"] = claude_response.session_id
-
-                # Check if Claude changed the working directory and update our tracking
-                _update_working_directory_from_claude_response(
-                    claude_response, context, settings, user_id
-                )
-
-                # Log interaction to storage
-                if storage:
-                    try:
-                        await storage.save_claude_interaction(
+            # Run Claude command in background task to avoid blocking handler
+            # This allows new messages to be processed and cancel previous tasks
+            # Check and cancel previous task for this user BEFORE starting new one
+            if hasattr(claude_integration, "active_tasks"):
+                if user_id in claude_integration.active_tasks:
+                    previous_task = claude_integration.active_tasks[user_id]
+                    if not previous_task.done():
+                        logger.info(
+                            "Cancelling previous task for user before starting new one",
                             user_id=user_id,
-                            session_id=claude_response.session_id,
-                            prompt=message_text,
-                            response=claude_response,
-                            ip_address=None,  # Telegram doesn't provide IP
                         )
-                    except Exception as storage_error:
-                        logger.warning(
-                            "Failed to log interaction to storage",
-                            error=str(storage_error),
-                        )
+                        previous_task.cancel()
+                        # Don't await - let it cancel in background to avoid blocking
+                        # The cancellation will be handled in run_command's exception handler
 
-                # Format response
-                from ..utils.formatting import ResponseFormatter
-
-                formatter = ResponseFormatter(settings)
-                formatted_messages = formatter.format_claude_response(
-                    claude_response.content
-                )
-
-                todo_text = _render_todo_list(
-                    (context.user_data.get("session_todos") or {}).get(
-                        claude_response.session_id, {}
-                    )
-                )
-                if todo_text and formatted_messages:
-                    formatted_messages[-1].text = (
-                        f"{formatted_messages[-1].text}\n\n{todo_text}"
-                    )
-
-            except asyncio.CancelledError:
-                # Task was cancelled due to new message from same user
-                logger.info(
-                    "Claude command cancelled due to new message",
-                    user_id=user_id,
-                )
-                # Delete progress message and return early - new message will be processed
+            # Create background task to handle the command
+            # This allows the handler to return immediately and process new messages
+            async def process_command():
+                claude_response = None
                 try:
-                    await progress_msg.delete()
-                except Exception:
-                    pass
-                return
-            except ClaudeToolValidationError as e:
-                # Tool validation error with detailed instructions
-                logger.error(
-                    "Tool validation error",
-                    error=str(e),
-                    user_id=user_id,
-                    blocked_tools=e.blocked_tools,
-                )
-                # Error message already formatted, create FormattedMessage
-                from ..utils.formatting import FormattedMessage
-
-                formatted_messages = [FormattedMessage(str(e), parse_mode="Markdown")]
-            except Exception as e:
-                logger.exception(
-                    "Claude integration failed", error=str(e), user_id=user_id
-                )
-                # Format error and create FormattedMessage
-                from ..utils.formatting import FormattedMessage
-
-                formatted_messages = [
-                    FormattedMessage(
-                        _format_error_message(str(e)), parse_mode="Markdown"
-                    )
-                ]
-
-            # Delete progress message
-            await progress_msg.delete()
-
-            # Send formatted responses (may be multiple messages)
-            for i, message in enumerate(formatted_messages):
-                try:
-                    await update.message.reply_text(
-                        message.text,
-                        parse_mode=message.parse_mode,
-                        reply_markup=message.reply_markup,
-                        reply_to_message_id=(
-                            update.message.message_id if i == 0 else None
-                        ),
+                    claude_response = await claude_integration.run_command(
+                        prompt=message_text,
+                        working_directory=current_dir,
+                        user_id=user_id,
+                        session_id=session_id,
+                        on_stream=stream_handler,
                     )
 
-                    # Small delay between messages to avoid rate limits
-                    if i < len(formatted_messages) - 1:
-                        await asyncio.sleep(0.5)
+                    # Update session ID
+                    context.user_data["claude_session_id"] = claude_response.session_id
 
-                except Exception as send_error:
-                    logger.error(
-                        "Failed to send response message",
-                        error=str(send_error),
-                        message_index=i,
-                    )
-                    # Try to send error message
-                    await update.message.reply_text(
-                        "❌ Failed to send response. Please try again.",
-                        reply_to_message_id=(
-                            update.message.message_id if i == 0 else None
-                        ),
+                    # Check if Claude changed the working directory and update our tracking
+                    _update_working_directory_from_claude_response(
+                        claude_response, context, settings, user_id
                     )
 
-            # Update session info
-            context.user_data["last_message"] = update.message.text
-
-            # Add conversation enhancements if available
-            features = context.bot_data.get("features")
-            conversation_enhancer = (
-                features.get_conversation_enhancer() if features else None
-            )
-
-            if conversation_enhancer and claude_response:
-                try:
-                    # Update conversation context
-                    conversation_enhancer.update_context(user_id, claude_response)
-                    conversation_context = conversation_enhancer.get_or_create_context(
-                        user_id
-                    )
-
-                    # Check if we should show follow-up suggestions
-                    if conversation_enhancer.should_show_suggestions(
-                        claude_response.tools_used or [], claude_response.content
-                    ):
-                        # Generate follow-up suggestions
-                        suggestions = (
-                            conversation_enhancer.generate_follow_up_suggestions(
-                                claude_response.content,
-                                claude_response.tools_used or [],
-                                conversation_context,
+                    # Log interaction to storage
+                    if storage:
+                        try:
+                            await storage.save_claude_interaction(
+                                user_id=user_id,
+                                session_id=claude_response.session_id,
+                                prompt=message_text,
+                                response=claude_response,
+                                ip_address=None,  # Telegram doesn't provide IP
                             )
-                        )
-
-                        if suggestions:
-                            # Create keyboard with suggestions
-                            suggestion_keyboard = (
-                                conversation_enhancer.create_follow_up_keyboard(
-                                    suggestions
-                                )
+                        except Exception as storage_error:
+                            logger.warning(
+                                "Failed to log interaction to storage",
+                                error=str(storage_error),
                             )
 
-                            # Send follow-up suggestions
+                    # Format response
+                    from ..utils.formatting import ResponseFormatter
+
+                    formatter = ResponseFormatter(settings)
+                    formatted_messages = formatter.format_claude_response(
+                        claude_response.content
+                    )
+
+                    todo_text = _render_todo_list(
+                        (context.user_data.get("session_todos") or {}).get(
+                            claude_response.session_id, {}
+                        )
+                    )
+                    if todo_text and formatted_messages:
+                        formatted_messages[-1].text = (
+                            f"{formatted_messages[-1].text}\n\n{todo_text}"
+                        )
+
+                    # Delete progress message
+                    try:
+                        await progress_msg.delete()
+                    except Exception:
+                        pass
+
+                    # Send formatted responses (may be multiple messages)
+                    for i, message in enumerate(formatted_messages):
+                        try:
                             await update.message.reply_text(
-                                "💡 **What would you like to do next?**",
-                                parse_mode="Markdown",
-                                reply_markup=suggestion_keyboard,
+                                message.text,
+                                parse_mode=message.parse_mode,
+                                reply_markup=message.reply_markup,
+                                reply_to_message_id=(
+                                    update.message.message_id if i == 0 else None
+                                ),
                             )
 
-                except Exception as conv_error:
-                    logger.warning(
-                        "Conversation enhancement failed",
-                        error=str(conv_error),
+                            # Small delay between messages to avoid rate limits
+                            if i < len(formatted_messages) - 1:
+                                await asyncio.sleep(0.5)
+
+                        except Exception as send_error:
+                            logger.error(
+                                "Failed to send response message",
+                                error=str(send_error),
+                                message_index=i,
+                            )
+                            # Try to send error message
+                            await update.message.reply_text(
+                                "❌ Failed to send response. Please try again.",
+                                reply_to_message_id=(
+                                    update.message.message_id if i == 0 else None
+                                ),
+                            )
+
+                    # Update session info
+                    context.user_data["last_message"] = update.message.text
+
+                    # Add conversation enhancements if available
+                    features = context.bot_data.get("features")
+                    conversation_enhancer = (
+                        features.get_conversation_enhancer() if features else None
+                    )
+
+                    if conversation_enhancer and claude_response:
+                        try:
+                            # Update conversation context
+                            conversation_enhancer.update_context(
+                                user_id, claude_response
+                            )
+                            conversation_context = (
+                                conversation_enhancer.get_or_create_context(user_id)
+                            )
+
+                            # Check if we should show follow-up suggestions
+                            if conversation_enhancer.should_show_suggestions(
+                                claude_response.tools_used or [],
+                                claude_response.content,
+                            ):
+                                # Generate follow-up suggestions
+                                suggestions = conversation_enhancer.generate_follow_up_suggestions(
+                                    claude_response.content,
+                                    claude_response.tools_used or [],
+                                    conversation_context,
+                                )
+
+                                if suggestions:
+                                    # Create inline keyboard with suggestions
+                                    from telegram import (
+                                        InlineKeyboardButton,
+                                        InlineKeyboardMarkup,
+                                    )
+
+                                    keyboard = [
+                                        [
+                                            InlineKeyboardButton(
+                                                suggestion,
+                                                callback_data=f"suggestion:{i}",
+                                            )
+                                        ]
+                                        for i, suggestion in enumerate(suggestions[:3])
+                                    ]
+                                    reply_markup = InlineKeyboardMarkup(keyboard)
+
+                                    await update.message.reply_text(
+                                        "💡 **Follow-up suggestions:**",
+                                        reply_markup=reply_markup,
+                                        parse_mode="Markdown",
+                                    )
+                        except Exception as enhancer_error:
+                            logger.warning(
+                                "Failed to add conversation enhancements",
+                                error=str(enhancer_error),
+                            )
+
+                except asyncio.CancelledError:
+                    # Task was cancelled due to new message from same user
+                    logger.info(
+                        "Claude command cancelled due to new message",
                         user_id=user_id,
                     )
+                    # Delete progress message and return early - new message will be processed
+                    try:
+                        await progress_msg.delete()
+                    except Exception:
+                        pass
+                    return
+                except ClaudeToolValidationError as e:
+                    # Tool validation error with detailed instructions
+                    logger.error(
+                        "Tool validation error",
+                        error=str(e),
+                        user_id=user_id,
+                        blocked_tools=e.blocked_tools,
+                    )
+                    # Error message already formatted, create FormattedMessage
+                    from ..utils.formatting import FormattedMessage
 
-            # Log successful message processing
-            if audit_logger:
-                await audit_logger.log_command(
-                    user_id=user_id,
-                    command="text_message",
-                    args=[update.message.text[:100]],  # First 100 chars
-                    success=True,
-                )
+                    formatted_messages = [
+                        FormattedMessage(str(e), parse_mode="Markdown")
+                    ]
 
-            logger.info("Text message processed successfully", user_id=user_id)
+                    # Delete progress message
+                    try:
+                        await progress_msg.delete()
+                    except Exception:
+                        pass
+
+                    # Send error message
+                    await update.message.reply_text(
+                        formatted_messages[0].text,
+                        parse_mode=formatted_messages[0].parse_mode,
+                        reply_to_message_id=update.message.message_id,
+                    )
+                except Exception as e:
+                    logger.exception(
+                        "Claude integration failed", error=str(e), user_id=user_id
+                    )
+                    # Format error and create FormattedMessage
+                    from ..utils.formatting import FormattedMessage
+
+                    formatted_messages = [
+                        FormattedMessage(
+                            _format_error_message(str(e)), parse_mode="Markdown"
+                        )
+                    ]
+
+                    # Delete progress message
+                    try:
+                        await progress_msg.delete()
+                    except Exception:
+                        pass
+
+                    # Send error message
+                    await update.message.reply_text(
+                        formatted_messages[0].text,
+                        parse_mode=formatted_messages[0].parse_mode,
+                        reply_to_message_id=update.message.message_id,
+                    )
+
+            # Start background task and return immediately
+            # This allows the handler to process new messages
+            task = asyncio.create_task(process_command())
+
+            # Store task in context for potential cancellation
+            if "background_tasks" not in context.user_data:
+                context.user_data["background_tasks"] = []
+            context.user_data["background_tasks"].append(task)
+
+            # Clean up completed tasks
+            context.user_data["background_tasks"] = [
+                t for t in context.user_data["background_tasks"] if not t.done()
+            ]
+
+            # Return immediately - task will handle response
+            return
 
         except Exception as e:
             # Clean up progress message if it exists
@@ -1112,22 +1174,22 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                         ),
                     )
 
-                        if i < len(formatted_messages) - 1:
-                            await asyncio.sleep(0.5)
+                    if i < len(formatted_messages) - 1:
+                        await asyncio.sleep(0.5)
 
-                except asyncio.CancelledError:
-                    # Task was cancelled due to new message from same user
-                    logger.info(
-                        "Photo processing cancelled due to new message",
-                        user_id=user_id,
-                    )
-                    try:
-                        await claude_progress_msg.delete()
-                    except Exception:
-                        pass
-                    return
-                except Exception as claude_error:
-                    await claude_progress_msg.edit_text(
+            except asyncio.CancelledError:
+                # Task was cancelled due to new message from same user
+                logger.info(
+                    "Document processing cancelled due to new message",
+                    user_id=user_id,
+                )
+                try:
+                    await claude_progress_msg.delete()
+                except Exception:
+                    pass
+                return
+            except Exception as claude_error:
+                await claude_progress_msg.edit_text(
                     _format_error_message(str(claude_error)),
                     parse_mode="Markdown",
                 )
@@ -1289,7 +1351,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 except asyncio.CancelledError:
                     # Task was cancelled due to new message from same user
                     logger.info(
-                        "Document processing cancelled due to new message",
+                        "Photo processing cancelled due to new message",
                         user_id=user_id,
                     )
                     try:

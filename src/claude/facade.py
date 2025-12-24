@@ -77,6 +77,8 @@ class ClaudeIntegration:
 
         # Track active tasks per user to allow cancellation
         self.active_tasks: Dict[int, asyncio.Task] = {}
+        # Track active process IDs per user for cursor-agent
+        self.active_process_ids: Dict[int, List[str]] = {}
 
     async def run_command(
         self,
@@ -108,7 +110,9 @@ class ClaudeIntegration:
                 try:
                     await previous_task
                 except asyncio.CancelledError:
-                    logger.debug("Previous task cancelled successfully", user_id=user_id)
+                    logger.debug(
+                        "Previous task cancelled successfully", user_id=user_id
+                    )
                 except Exception as e:
                     logger.warning(
                         "Error while cancelling previous task",
@@ -209,6 +213,7 @@ class ClaudeIntegration:
                         session_id=claude_session_id,
                         continue_session=should_continue,
                         stream_callback=stream_handler,
+                        user_id=user_id,
                     )
 
                 task = asyncio.create_task(execute_wrapper())
@@ -218,19 +223,27 @@ class ClaudeIntegration:
                     response = await task
                 except asyncio.CancelledError:
                     logger.info("Task cancelled", user_id=user_id)
-                    # Try to kill active processes for this user
+                    # Gracefully terminate active processes for this user
+                    # This allows session to be saved before process exits
                     try:
-                        await self.manager.kill_all_processes()
+                        if hasattr(self.manager, "kill_user_processes"):
+                            await self.manager.kill_user_processes(user_id)
+                        else:
+                            # Fallback for managers without user-specific termination
+                            await self.manager.kill_all_processes()
                     except Exception as kill_error:
                         logger.warning(
-                            "Failed to kill processes after cancellation",
+                            "Failed to terminate processes after cancellation",
                             user_id=user_id,
                             error=str(kill_error),
                         )
                     raise
                 finally:
                     # Clean up task tracking
-                    if user_id in self.active_tasks and self.active_tasks[user_id] == task:
+                    if (
+                        user_id in self.active_tasks
+                        and self.active_tasks[user_id] == task
+                    ):
                         del self.active_tasks[user_id]
 
                 # Check if tool validation failed
@@ -338,6 +351,7 @@ class ClaudeIntegration:
         session_id: Optional[str] = None,
         continue_session: bool = False,
         stream_callback: Optional[Callable] = None,
+        user_id: Optional[int] = None,
     ) -> ClaudeResponse:
         """Execute command using configured agent (no fallback)."""
         logger.debug(
@@ -346,13 +360,28 @@ class ClaudeIntegration:
             working_directory=str(working_directory),
         )
 
-        return await self.manager.execute_command(
-            prompt=prompt,
-            working_directory=working_directory,
-            session_id=session_id,
-            continue_session=continue_session,
-            stream_callback=stream_callback,
-        )
+        # Check if manager supports user_id parameter
+        import inspect
+
+        sig = inspect.signature(self.manager.execute_command)
+        if "user_id" in sig.parameters:
+            return await self.manager.execute_command(
+                prompt=prompt,
+                working_directory=working_directory,
+                session_id=session_id,
+                continue_session=continue_session,
+                stream_callback=stream_callback,
+                user_id=user_id,
+            )
+        else:
+            # Fallback for managers that don't support user_id
+            return await self.manager.execute_command(
+                prompt=prompt,
+                working_directory=working_directory,
+                session_id=session_id,
+                continue_session=continue_session,
+                stream_callback=stream_callback,
+            )
 
     async def continue_session(
         self,

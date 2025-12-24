@@ -10,6 +10,7 @@ Features:
 import asyncio
 import json
 import shutil
+import signal
 import uuid
 import os
 from asyncio.subprocess import Process
@@ -84,6 +85,10 @@ class CursorAgentManager:
         """Initialize cursor-agent manager with configuration."""
         self.config = config
         self.active_processes: Dict[str, Process] = {}
+        # Track processes by user_id for cancellation
+        self.user_processes: Dict[int, List[str]] = {}
+        # Track cancellation flags per user
+        self.cancelled_users: Dict[int, bool] = {}
 
         # Memory optimization settings
         self.max_message_buffer = 1000
@@ -111,6 +116,7 @@ class CursorAgentManager:
         session_id: Optional[str] = None,
         continue_session: bool = False,
         stream_callback: Optional[Callable[[StreamUpdate], None]] = None,
+        user_id: Optional[int] = None,
     ) -> ClaudeResponse:
         """Execute cursor-agent command."""
         if not self.cursor_agent_path:
@@ -153,9 +159,17 @@ class CursorAgentManager:
                 process = await self._start_process(cmd, working_directory)
                 self.active_processes[process_id] = process
 
+                # Track process by user_id if provided
+                if user_id is not None:
+                    if user_id not in self.user_processes:
+                        self.user_processes[user_id] = []
+                    self.user_processes[user_id].append(process_id)
+                    # Reset cancellation flag for this user
+                    self.cancelled_users[user_id] = False
+
                 # Handle output with timeout
                 result = await asyncio.wait_for(
-                    self._handle_process_output(process, stream_callback),
+                    self._handle_process_output(process, stream_callback, user_id),
                     timeout=self.config.claude_timeout_seconds,
                 )
 
@@ -204,6 +218,19 @@ class CursorAgentManager:
                 if process_id in self.active_processes:
                     del self.active_processes[process_id]
 
+                # Remove from user tracking
+                if user_id is not None and user_id in self.user_processes:
+                    if process_id in self.user_processes[user_id]:
+                        self.user_processes[user_id].remove(process_id)
+                    if not self.user_processes[user_id]:
+                        del self.user_processes[user_id]
+
+                # Clean up cancellation flag if process completed normally
+                if user_id is not None and user_id in self.cancelled_users:
+                    # Only remove if it wasn't cancelled (to avoid race condition)
+                    if not self.cancelled_users.get(user_id, False):
+                        del self.cancelled_users[user_id]
+
     def _build_command(
         self,
         prompt: str,
@@ -251,6 +278,7 @@ class CursorAgentManager:
         """Start cursor-agent subprocess."""
         return await asyncio.create_subprocess_exec(
             *cmd,
+            stdin=asyncio.subprocess.DEVNULL,  # Don't use stdin to avoid blocking
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=str(cwd),
@@ -258,7 +286,10 @@ class CursorAgentManager:
         )
 
     async def _handle_process_output(
-        self, process: Process, stream_callback: Optional[Callable]
+        self,
+        process: Process,
+        stream_callback: Optional[Callable],
+        user_id: Optional[int] = None,
     ) -> ClaudeResponse:
         """Handle cursor-agent output with streaming support."""
         with tracer.start_as_current_span("cursor_agent.output") as span:
@@ -270,7 +301,23 @@ class CursorAgentManager:
             thinking_content = []
             assistant_content_parts = []
 
-            async for line in self._read_stream_bounded(process.stdout):
+            # Create cancellation check function
+            def check_cancelled() -> bool:
+                return user_id is not None and self.cancelled_users.get(user_id, False)
+
+            async for line in self._read_stream_bounded(
+                process.stdout, check_cancelled
+            ):
+                # Check if this user's process was cancelled
+                if check_cancelled():
+                    logger.info(
+                        "Process cancelled during stream reading",
+                        user_id=user_id,
+                    )
+                    # Try graceful cancellation
+                    await self._graceful_cancel_process(process, user_id)
+                    raise asyncio.CancelledError("Process cancelled by user")
+
                 if not line:
                     continue
 
@@ -394,12 +441,24 @@ class CursorAgentManager:
                 result, list(message_buffer), assistant_content_parts
             )
 
-    async def _read_stream_bounded(self, stream: Any) -> AsyncIterator[str]:
-        """Read stream with memory bounds."""
+    async def _read_stream_bounded(
+        self, stream: Any, check_cancelled: Optional[Callable[[], bool]] = None
+    ) -> AsyncIterator[str]:
+        """Read stream with memory bounds and optional cancellation check."""
         buffer = b""
 
         while True:
-            chunk = await stream.read(self.streaming_buffer_size)
+            # Use wait_for with short timeout to allow cancellation checks
+            try:
+                chunk = await asyncio.wait_for(
+                    stream.read(self.streaming_buffer_size), timeout=0.5
+                )
+            except asyncio.TimeoutError:
+                # Check cancellation if provided
+                if check_cancelled and check_cancelled():
+                    break
+                continue
+
             if not chunk:
                 break
 
@@ -408,6 +467,10 @@ class CursorAgentManager:
             while b"\n" in buffer:
                 line, buffer = buffer.split(b"\n", 1)
                 yield line.decode("utf-8", errors="replace").strip()
+
+            # Check cancellation after each line
+            if check_cancelled and check_cancelled():
+                break
 
         if buffer:
             yield buffer.decode("utf-8", errors="replace").strip()
@@ -591,7 +654,11 @@ class CursorAgentManager:
                     "Created tool span (started)",
                     tool_name=tool_name,
                     call_id=call_id,
-                    span_id=format(span.get_span_context().span_id, '016x') if span.get_span_context().is_valid else "invalid",
+                    span_id=(
+                        format(span.get_span_context().span_id, "016x")
+                        if span.get_span_context().is_valid
+                        else "invalid"
+                    ),
                 )
 
                 # Add MCP-specific attributes if this is an MCP tool
@@ -633,7 +700,9 @@ class CursorAgentManager:
                 else:
                     # Interactive mode - validation happens in cursor-agent UI
                     span.set_attribute("tool.validated", True)
-                    span.set_attribute("tool.validation_mode", "cursor_agent_interactive")
+                    span.set_attribute(
+                        "tool.validation_mode", "cursor_agent_interactive"
+                    )
 
                 span.set_attribute("tool.mcps_approved", approve_mcps)
 
@@ -648,20 +717,28 @@ class CursorAgentManager:
                             if isinstance(value, (str, int, float, bool, type(None))):
                                 # Simple types - add directly (limit string size)
                                 if isinstance(value, str):
-                                    span.set_attribute(f"tool.input.{key}", value[:1000])
+                                    span.set_attribute(
+                                        f"tool.input.{key}", value[:1000]
+                                    )
                                 else:
                                     span.set_attribute(f"tool.input.{key}", value)
                             else:
                                 # Complex types - serialize to JSON
                                 try:
-                                    json_value = json_module.dumps(value, ensure_ascii=False)
+                                    json_value = json_module.dumps(
+                                        value, ensure_ascii=False
+                                    )
                                     # Limit JSON size to avoid span bloat
                                     if len(json_value) > 2000:
-                                        json_value = json_value[:2000] + "...(truncated)"
+                                        json_value = (
+                                            json_value[:2000] + "...(truncated)"
+                                        )
                                     span.set_attribute(f"tool.input.{key}", json_value)
                                 except (TypeError, ValueError):
                                     # If can't serialize, just use str()
-                                    span.set_attribute(f"tool.input.{key}", str(value)[:1000])
+                                    span.set_attribute(
+                                        f"tool.input.{key}", str(value)[:1000]
+                                    )
                     except Exception as e:
                         logger.warning(
                             "Failed to add tool arguments to span",
@@ -731,18 +808,26 @@ class CursorAgentManager:
                                 span.set_attribute("tool.output", mcp_output)
 
                             span.set_attribute("tool.mcp.is_error", is_error)
-                            span.set_attribute("tool.status", "error" if is_error else "success")
+                            span.set_attribute(
+                                "tool.status", "error" if is_error else "success"
+                            )
                             if is_error and not error_message:
-                                error_message = success_data.get("message") or (mcp_output if text_parts else None)
+                                error_message = success_data.get("message") or (
+                                    mcp_output if text_parts else None
+                                )
 
                             # Serialize full MCP result
                             try:
-                                json_result = json_module.dumps(tool_result, ensure_ascii=False)
+                                json_result = json_module.dumps(
+                                    tool_result, ensure_ascii=False
+                                )
                                 if len(json_result) > 5000:
                                     json_result = json_result[:5000] + "...(truncated)"
                                 span.set_attribute("tool.result", json_result)
                             except (TypeError, ValueError):
-                                span.set_attribute("tool.result", str(tool_result)[:5000])
+                                span.set_attribute(
+                                    "tool.result", str(tool_result)[:5000]
+                                )
 
                         # Handle different result types
                         elif isinstance(tool_result, str):
@@ -755,7 +840,10 @@ class CursorAgentManager:
                             span.set_attribute("tool.output", result_preview)
 
                             # Check if result contains error indicators
-                            if any(err in tool_result.lower() for err in ["error:", "failed:", "exception:"]):
+                            if any(
+                                err in tool_result.lower()
+                                for err in ["error:", "failed:", "exception:"]
+                            ):
                                 is_error = True
                                 if not error_message:
                                     error_message = tool_result
@@ -779,25 +867,35 @@ class CursorAgentManager:
                                 if status in ["error", "failed", "rejected"]:
                                     is_error = True
                                     if not error_message:
-                                        error_message = str(tool_result.get("error") or status)
+                                        error_message = str(
+                                            tool_result.get("error") or status
+                                        )
 
                             # Serialize full result as JSON
                             try:
-                                json_result = json_module.dumps(tool_result, ensure_ascii=False)
+                                json_result = json_module.dumps(
+                                    tool_result, ensure_ascii=False
+                                )
                                 if len(json_result) > 5000:
                                     json_result = json_result[:5000] + "...(truncated)"
                                 span.set_attribute("tool.result", json_result)
                             except (TypeError, ValueError):
-                                span.set_attribute("tool.result", str(tool_result)[:5000])
+                                span.set_attribute(
+                                    "tool.result", str(tool_result)[:5000]
+                                )
                         else:
                             # Other types - serialize to JSON or str
                             try:
-                                json_result = json_module.dumps(tool_result, ensure_ascii=False)
+                                json_result = json_module.dumps(
+                                    tool_result, ensure_ascii=False
+                                )
                                 if len(json_result) > 5000:
                                     json_result = json_result[:5000] + "...(truncated)"
                                 span.set_attribute("tool.output", json_result)
                             except (TypeError, ValueError):
-                                span.set_attribute("tool.output", str(tool_result)[:5000])
+                                span.set_attribute(
+                                    "tool.output", str(tool_result)[:5000]
+                                )
                     except Exception as e:
                         logger.warning(
                             "Failed to add tool result to span",
@@ -809,7 +907,9 @@ class CursorAgentManager:
 
                 # Set span status based on whether there was an error
                 if is_error:
-                    span.set_status(Status(StatusCode.ERROR, description="tool_execution_failed"))
+                    span.set_status(
+                        Status(StatusCode.ERROR, description="tool_execution_failed")
+                    )
                 else:
                     span.set_status(Status(StatusCode.OK))
 
@@ -822,7 +922,11 @@ class CursorAgentManager:
                     tool_name=tool_name,
                     has_result=bool(tool_result),
                     is_error=is_error,
-                    span_id=format(span.get_span_context().span_id, '016x') if span.get_span_context().is_valid else "invalid",
+                    span_id=(
+                        format(span.get_span_context().span_id, "016x")
+                        if span.get_span_context().is_valid
+                        else "invalid"
+                    ),
                 )
 
                 # Clean up tracking entry
@@ -986,24 +1090,154 @@ class CursorAgentManager:
         # Fallback: return original content
         return content
 
+    async def _graceful_cancel_process(
+        self, process: Process, user_id: Optional[int] = None
+    ) -> None:
+        """Gracefully cancel a process using multiple strategies.
+
+        Tries in order:
+        1. Send SIGINT signal (interrupt, like Ctrl+C)
+        2. Send SIGTERM signal (termination)
+        3. Force kill with SIGKILL (last resort)
+        """
+        try:
+            # Strategy 1: Send SIGINT (interrupt signal, like Ctrl+C)
+            if process.returncode is None:
+                try:
+                    logger.debug(
+                        "Sending SIGINT to process",
+                        user_id=user_id,
+                        pid=process.pid,
+                    )
+                    process.send_signal(signal.SIGINT)
+                    # Give process time to handle SIGINT (max 2 seconds)
+                    try:
+                        await asyncio.wait_for(process.wait(), timeout=2.0)
+                        logger.info(
+                            "Process cancelled gracefully via SIGINT",
+                            user_id=user_id,
+                        )
+                        return
+                    except asyncio.TimeoutError:
+                        logger.debug(
+                            "Process didn't respond to SIGINT, trying SIGTERM",
+                            user_id=user_id,
+                        )
+                except ProcessLookupError:
+                    # Process already terminated
+                    return
+                except Exception as e:
+                    logger.debug(
+                        "Failed to send SIGINT, trying SIGTERM",
+                        user_id=user_id,
+                        error=str(e),
+                    )
+
+            # Strategy 2: Send SIGTERM (termination signal)
+            if process.returncode is None:
+                try:
+                    logger.debug(
+                        "Sending SIGTERM to process",
+                        user_id=user_id,
+                        pid=process.pid,
+                    )
+                    process.terminate()
+                    # Give process time to handle SIGTERM (max 2 seconds)
+                    try:
+                        await asyncio.wait_for(process.wait(), timeout=2.0)
+                        logger.info(
+                            "Process cancelled gracefully via SIGTERM",
+                            user_id=user_id,
+                        )
+                        return
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            "Process didn't respond to SIGTERM, forcing kill",
+                            user_id=user_id,
+                        )
+                except ProcessLookupError:
+                    # Process already terminated
+                    return
+                except Exception as e:
+                    logger.warning(
+                        "Failed to send SIGTERM, forcing kill",
+                        user_id=user_id,
+                        error=str(e),
+                    )
+
+            # Strategy 3: Force kill (last resort)
+            if process.returncode is None:
+                try:
+                    logger.warning(
+                        "Force killing process (last resort)",
+                        user_id=user_id,
+                        pid=process.pid,
+                    )
+                    process.kill()
+                    await process.wait()
+                except ProcessLookupError:
+                    # Process already terminated
+                    pass
+                except Exception as e:
+                    logger.warning(
+                        "Failed to force kill process",
+                        user_id=user_id,
+                        error=str(e),
+                    )
+
+        except Exception as e:
+            logger.warning(
+                "Error during graceful cancellation",
+                user_id=user_id,
+                error=str(e),
+            )
+
     async def kill_all_processes(self) -> None:
-        """Kill all active cursor-agent processes."""
+        """Terminate all active cursor-agent processes gracefully."""
         logger.info(
-            "Killing all active cursor-agent processes",
+            "Terminating all active cursor-agent processes",
             count=len(self.active_processes),
         )
 
-        for process_id, process in self.active_processes.items():
-            try:
-                process.kill()
-                await process.wait()
-                logger.info("Killed cursor-agent process", process_id=process_id)
-            except Exception as e:
-                logger.warning(
-                    "Failed to kill process", process_id=process_id, error=str(e)
-                )
+        process_ids = list(self.active_processes.keys())
+        for process_id in process_ids:
+            if process_id in self.active_processes:
+                process = self.active_processes[process_id]
+                await self._graceful_cancel_process(process)
 
         self.active_processes.clear()
+        self.user_processes.clear()
+
+    async def kill_user_processes(self, user_id: int) -> None:
+        """Terminate all active processes for a specific user gracefully."""
+        # Set cancellation flag first to stop stream reading
+        self.cancelled_users[user_id] = True
+
+        if user_id not in self.user_processes:
+            return
+
+        process_ids = self.user_processes[user_id].copy()
+        logger.info(
+            "Terminating cursor-agent processes for user (graceful shutdown)",
+            user_id=user_id,
+            count=len(process_ids),
+        )
+
+        for process_id in process_ids:
+            if process_id in self.active_processes:
+                process = self.active_processes[process_id]
+                await self._graceful_cancel_process(process, user_id=user_id)
+                # Clean up
+                if process_id in self.active_processes:
+                    del self.active_processes[process_id]
+
+        # Clean up user tracking
+        if user_id in self.user_processes:
+            del self.user_processes[user_id]
+
+        # Clean up cancellation flag
+        if user_id in self.cancelled_users:
+            del self.cancelled_users[user_id]
 
     def get_active_process_count(self) -> int:
         """Get number of active processes."""

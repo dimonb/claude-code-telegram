@@ -2,6 +2,7 @@
 
 import asyncio
 import re
+from typing import Optional
 
 import structlog
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -552,12 +553,92 @@ async def _handle_continue_action(query, context: ContextTypes.DEFAULT_TYPE) -> 
                 parse_mode="Markdown",
             )
 
-            claude_response = await claude_integration.run_command(
-                prompt="",  # Empty prompt triggers --continue
-                working_directory=current_dir,
-                user_id=user_id,
-                session_id=claude_session_id,
-            )
+            # Check and cancel previous task for this user BEFORE starting new one
+            if hasattr(claude_integration, "active_tasks"):
+                if user_id in claude_integration.active_tasks:
+                    previous_task = claude_integration.active_tasks[user_id]
+                    if not previous_task.done():
+                        logger.info(
+                            "Cancelling previous task for user before continuing session",
+                            user_id=user_id,
+                        )
+                        previous_task.cancel()
+
+            # Create background task to handle the command
+            async def process_continue():
+                try:
+                    claude_response = await claude_integration.run_command(
+                        prompt="",  # Empty prompt triggers --continue
+                        working_directory=current_dir,
+                        user_id=user_id,
+                        session_id=claude_session_id,
+                    )
+
+                    if claude_response:
+                        # Update session ID in context
+                        context.user_data["claude_session_id"] = (
+                            claude_response.session_id
+                        )
+
+                        # Send Claude's response
+                        await query.message.reply_text(
+                            f"✅ **Session Continued**\n\n"
+                            f"{claude_response.content[:500]}{'...' if len(claude_response.content) > 500 else ''}",
+                            parse_mode="Markdown",
+                        )
+                    else:
+                        # No session found to continue
+                        await query.edit_message_text(
+                            "❌ **No Session Found**\n\n"
+                            f"No recent Claude session found in this directory.\n"
+                            f"Directory: `{current_dir.relative_to(settings.approved_directory)}/`\n\n"
+                            f"**What you can do:**\n"
+                            f"• Use the button below to start a fresh session\n"
+                            f"• Check your session status\n"
+                            f"• Navigate to a different directory",
+                            parse_mode="Markdown",
+                            reply_markup=InlineKeyboardMarkup(
+                                [
+                                    [
+                                        InlineKeyboardButton(
+                                            "🆕 Start New Session",
+                                            callback_data="new_session",
+                                        )
+                                    ]
+                                ]
+                            ),
+                        )
+                except asyncio.CancelledError:
+                    logger.info(
+                        "Continue session cancelled due to new message",
+                        user_id=user_id,
+                    )
+                    return
+                except Exception as e:
+                    logger.exception(
+                        "Error continuing session in background",
+                        error=str(e),
+                        user_id=user_id,
+                    )
+                    await query.edit_message_text(
+                        f"❌ **Error Continuing Session**\n\n{str(e)}"
+                    )
+
+            # Start background task and return immediately
+            task = asyncio.create_task(process_continue())
+
+            # Store task in context
+            if "background_tasks" not in context.user_data:
+                context.user_data["background_tasks"] = []
+            context.user_data["background_tasks"].append(task)
+
+            # Clean up completed tasks
+            context.user_data["background_tasks"] = [
+                t for t in context.user_data["background_tasks"] if not t.done()
+            ]
+
+            # Return immediately - task will handle response
+            return
         else:
             # No session in context, try to find the most recent session
             await query.edit_message_text(
@@ -566,46 +647,94 @@ async def _handle_continue_action(query, context: ContextTypes.DEFAULT_TYPE) -> 
                 parse_mode="Markdown",
             )
 
-            claude_response = await claude_integration.continue_session(
-                user_id=user_id,
-                working_directory=current_dir,
-                prompt=None,  # No prompt = use --continue
-            )
+            # Check and cancel previous task for this user BEFORE starting new one
+            if hasattr(claude_integration, "active_tasks"):
+                if user_id in claude_integration.active_tasks:
+                    previous_task = claude_integration.active_tasks[user_id]
+                    if not previous_task.done():
+                        logger.info(
+                            "Cancelling previous task for user before continuing session",
+                            user_id=user_id,
+                        )
+                        previous_task.cancel()
 
-        if claude_response:
-            # Update session ID in context
-            context.user_data["claude_session_id"] = claude_response.session_id
+            # Create background task to handle the command
+            async def process_continue_session():
+                try:
+                    claude_response = await claude_integration.continue_session(
+                        user_id=user_id,
+                        working_directory=current_dir,
+                        prompt=None,  # No prompt = use --continue
+                    )
 
-            # Send Claude's response
-            await query.message.reply_text(
-                f"✅ **Session Continued**\n\n"
-                f"{claude_response.content[:500]}{'...' if len(claude_response.content) > 500 else ''}",
-                parse_mode="Markdown",
-            )
-        else:
-            # No session found to continue
-            await query.edit_message_text(
-                "❌ **No Session Found**\n\n"
-                f"No recent Claude session found in this directory.\n"
-                f"Directory: `{current_dir.relative_to(settings.approved_directory)}/`\n\n"
-                f"**What you can do:**\n"
-                f"• Use the button below to start a fresh session\n"
-                f"• Check your session status\n"
-                f"• Navigate to a different directory",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup(
-                    [
-                        [
-                            InlineKeyboardButton(
-                                "🆕 New Session", callback_data="action:new_session"
+                    if claude_response:
+                        # Update session ID in context
+                        context.user_data["claude_session_id"] = (
+                            claude_response.session_id
+                        )
+
+                        # Send Claude's response
+                        await query.message.reply_text(
+                            f"✅ **Session Continued**\n\n"
+                            f"{claude_response.content[:500]}{'...' if len(claude_response.content) > 500 else ''}",
+                            parse_mode="Markdown",
+                        )
+                    else:
+                        # No session found to continue
+                        await query.edit_message_text(
+                            "❌ **No Session Found**\n\n"
+                            f"No recent Claude session found in this directory.\n"
+                            f"Directory: `{current_dir.relative_to(settings.approved_directory)}/`\n\n"
+                            f"**What you can do:**\n"
+                            f"• Use the button below to start a fresh session\n"
+                            f"• Check your session status\n"
+                            f"• Navigate to a different directory",
+                            parse_mode="Markdown",
+                            reply_markup=InlineKeyboardMarkup(
+                                [
+                                    [
+                                        InlineKeyboardButton(
+                                            "🆕 New Session",
+                                            callback_data="action:new_session",
+                                        ),
+                                        InlineKeyboardButton(
+                                            "📊 Status", callback_data="action:status"
+                                        ),
+                                    ]
+                                ]
                             ),
-                            InlineKeyboardButton(
-                                "📊 Status", callback_data="action:status"
-                            ),
-                        ]
-                    ]
-                ),
-            )
+                        )
+                except asyncio.CancelledError:
+                    logger.info(
+                        "Continue session cancelled due to new message",
+                        user_id=user_id,
+                    )
+                    return
+                except Exception as e:
+                    logger.exception(
+                        "Error continuing session in background",
+                        error=str(e),
+                        user_id=user_id,
+                    )
+                    await query.edit_message_text(
+                        f"❌ **Error Continuing Session**\n\n{str(e)}"
+                    )
+
+            # Start background task and return immediately
+            task = asyncio.create_task(process_continue_session())
+
+            # Store task in context
+            if "background_tasks" not in context.user_data:
+                context.user_data["background_tasks"] = []
+            context.user_data["background_tasks"].append(task)
+
+            # Clean up completed tasks
+            context.user_data["background_tasks"] = [
+                t for t in context.user_data["background_tasks"] if not t.done()
+            ]
+
+            # Return immediately - task will handle response
+            return
 
     except Exception as e:
         logger.exception("Error in continue action", error=str(e), user_id=user_id)
@@ -970,26 +1099,78 @@ async def handle_quick_action_callback(
             parse_mode="Markdown",
         )
 
-        # Run the action through Claude
-        claude_response = await claude_integration.run_command(
-            prompt=action.command, working_directory=current_dir, user_id=user_id
-        )
+        # Check and cancel previous task for this user BEFORE starting new one
+        if hasattr(claude_integration, "active_tasks"):
+            if user_id in claude_integration.active_tasks:
+                previous_task = claude_integration.active_tasks[user_id]
+                if not previous_task.done():
+                    logger.info(
+                        "Cancelling previous task for user before starting quick action",
+                        user_id=user_id,
+                        action_id=action_id,
+                    )
+                    previous_task.cancel()
 
-        if claude_response:
-            # Format and send the response
-            response_text = claude_response.content
-            if len(response_text) > 4000:
-                response_text = response_text[:4000] + "...\n\n_(Response truncated)_"
+        # Create background task to handle the command
+        async def process_action():
+            try:
+                claude_response = await claude_integration.run_command(
+                    prompt=action.command,
+                    working_directory=current_dir,
+                    user_id=user_id,
+                )
 
-            await query.message.reply_text(
-                f"✅ **{action.icon} {action.name} Complete**\n\n{response_text}",
-                parse_mode="Markdown",
-            )
-        else:
-            await query.edit_message_text(
-                f"❌ **Action Failed**\n\n"
-                f"Failed to execute {action.name}. Please try again."
-            )
+                if claude_response:
+                    # Format and send the response
+                    response_text = claude_response.content
+                    if len(response_text) > 4000:
+                        response_text = (
+                            response_text[:4000] + "...\n\n_(Response truncated)_"
+                        )
+
+                    await query.message.reply_text(
+                        f"✅ **{action.icon} {action.name} Complete**\n\n{response_text}",
+                        parse_mode="Markdown",
+                    )
+                else:
+                    await query.edit_message_text(
+                        f"❌ **Action Failed**\n\n"
+                        f"Failed to execute {action.name}. Please try again."
+                    )
+            except asyncio.CancelledError:
+                logger.info(
+                    "Quick action cancelled due to new message",
+                    user_id=user_id,
+                    action_id=action_id,
+                )
+                return
+            except Exception as e:
+                logger.exception(
+                    "Quick action execution failed in background",
+                    error=str(e),
+                    user_id=user_id,
+                    action_id=action_id,
+                )
+                await query.edit_message_text(
+                    f"❌ **Action Error**\n\n"
+                    f"An error occurred while executing {action_id}: {str(e)}"
+                )
+
+        # Start background task and return immediately
+        task = asyncio.create_task(process_action())
+
+        # Store task in context
+        if "background_tasks" not in context.user_data:
+            context.user_data["background_tasks"] = []
+        context.user_data["background_tasks"].append(task)
+
+        # Clean up completed tasks
+        context.user_data["background_tasks"] = [
+            t for t in context.user_data["background_tasks"] if not t.done()
+        ]
+
+        # Return immediately - task will handle response
+        return
 
     except Exception as e:
         logger.exception("Quick action execution failed", error=str(e), user_id=user_id)
@@ -1632,84 +1813,140 @@ async def handle_project_command_callback(
             except Exception as e:
                 logger.exception("Stream handler error", error=str(e))
 
-        # Execute the command via Claude integration with streaming
-        try:
-            claude_response = await claude_integration.run_command(
-                prompt=prompt,
-                working_directory=current_dir,
-                user_id=user_id,
-                on_stream=stream_handler,
-            )
-        except asyncio.CancelledError:
-            # Task was cancelled due to new message from same user
-            logger.info(
-                "Project command cancelled due to new message",
-                user_id=user_id,
-                command=command_name,
-            )
-            # Try to update progress message
+        # Check and cancel previous task for this user BEFORE starting new one
+        if hasattr(claude_integration, "active_tasks"):
+            if user_id in claude_integration.active_tasks:
+                previous_task = claude_integration.active_tasks[user_id]
+                if not previous_task.done():
+                    logger.info(
+                        "Cancelling previous task for user before starting new one",
+                        user_id=user_id,
+                        command=command_name,
+                    )
+                    previous_task.cancel()
+                    # Don't await - let it cancel in background to avoid blocking
+
+        # Create background task to handle the command
+        # This allows the handler to return immediately and process new messages
+        async def process_command():
+            claude_response = None
             try:
-                await progress_msg.edit_text(
-                    "⏹️ **Command cancelled**\n\n"
-                    "Previous command was cancelled due to a new message.",
-                    parse_mode="MarkdownV2",
-                )
-            except Exception:
-                pass
-            return
-
-        # Update session ID in context if we got one
-        if claude_response and claude_response.session_id:
-            context.user_data["claude_session_id"] = claude_response.session_id
-
-        if claude_response:
-            # Format response
-            response_content = claude_response.content or ""
-            full_text = f"✅ **/{command_name}** completed\n\n{response_content}"
-
-            # Send full result, split into safe chunks if needed
-            for part in _split_for_telegram(full_text):
-                await _safe_send_message(
-                    query.message,
-                    part,
-                    parse_mode="Markdown",
-                    disable_web_page_preview=True,
-                )
-
-            # Log success
-            if audit_logger:
-                await audit_logger.log_command(
+                claude_response = await claude_integration.run_command(
+                    prompt=prompt,
+                    working_directory=current_dir,
                     user_id=user_id,
-                    command=f"pcmd:{command_name}",
-                    args=[],
-                    success=True,
+                    on_stream=stream_handler,
                 )
 
-            logger.info(
-                "Project command executed",
-                user_id=user_id,
-                command=command_name,
-                duration_ms=claude_response.duration_ms,
-            )
-        else:
-            await query.edit_message_text(
-                f"❌ **Command Failed**\n\n"
-                f"Failed to execute `/{command_name}`.\n"
-                f"Please try again or check the command file.",
-                parse_mode="Markdown",
-            )
+                # Update session ID in context if we got one
+                if claude_response and claude_response.session_id:
+                    context.user_data["claude_session_id"] = claude_response.session_id
+
+                if claude_response:
+                    # Format response
+                    response_content = claude_response.content or ""
+                    full_text = (
+                        f"✅ **/{command_name}** completed\n\n{response_content}"
+                    )
+
+                    # Send full result, split into safe chunks if needed
+                    for part in _split_for_telegram(full_text):
+                        await _safe_send_message(
+                            query.message,
+                            part,
+                            parse_mode="Markdown",
+                            disable_web_page_preview=True,
+                        )
+
+                    # Log success
+                    if audit_logger:
+                        await audit_logger.log_command(
+                            user_id=user_id,
+                            command=f"pcmd:{command_name}",
+                            args=[],
+                            success=True,
+                        )
+
+                    logger.info(
+                        "Project command executed",
+                        user_id=user_id,
+                        command=command_name,
+                        duration_ms=claude_response.duration_ms,
+                    )
+                else:
+                    await query.edit_message_text(
+                        f"❌ **Command Failed**\n\n"
+                        f"Failed to execute `/{command_name}`.\n"
+                        f"Please try again or check the command file.",
+                        parse_mode="Markdown",
+                    )
+            except asyncio.CancelledError:
+                # Task was cancelled due to new message from same user
+                logger.info(
+                    "Project command cancelled due to new message",
+                    user_id=user_id,
+                    command=command_name,
+                )
+                # Try to update progress message
+                try:
+                    await progress_msg.edit_text(
+                        "⏹️ **Command cancelled**\n\n"
+                        "Previous command was cancelled due to a new message.",
+                        parse_mode="MarkdownV2",
+                    )
+                except Exception:
+                    pass
+                return
+            except Exception as e:
+                logger.exception(
+                    "Error executing project command in background",
+                    error=str(e),
+                    user_id=user_id,
+                    command=command_name,
+                )
+                await query.edit_message_text(
+                    f"❌ **Error Executing Command**\n\n"
+                    f"Command: `/{command_name}`\n"
+                    f"Error: `{str(e)[:200]}`\n\n"
+                    f"Try again or contact support.",
+                    parse_mode="Markdown",
+                )
+
+                if audit_logger:
+                    await audit_logger.log_command(
+                        user_id=user_id,
+                        command=f"pcmd:{command_name}",
+                        args=[],
+                        success=False,
+                    )
+
+        # Start background task and return immediately
+        task = asyncio.create_task(process_command())
+
+        # Store task in context for potential cancellation
+        if "background_tasks" not in context.user_data:
+            context.user_data["background_tasks"] = []
+        context.user_data["background_tasks"].append(task)
+
+        # Clean up completed tasks
+        context.user_data["background_tasks"] = [
+            t for t in context.user_data["background_tasks"] if not t.done()
+        ]
+
+        # Return immediately - task will handle response
+        return
 
     except Exception as e:
         error_msg = str(e)
         logger.exception(
-            "Error executing project command",
+            "Error setting up project command",
             error=error_msg,
             user_id=user_id,
             command=command_name,
         )
 
         await query.edit_message_text(
-            f"❌ **Error Executing Command**\n\n"
+            f"❌ **Error Setting Up Command**\n\n"
             f"Command: `/{command_name}`\n"
             f"Error: `{error_msg[:200]}`\n\n"
             f"Try again or contact support.",
