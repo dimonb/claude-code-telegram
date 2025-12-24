@@ -3,7 +3,7 @@
 import asyncio
 import json
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 import structlog
 from opentelemetry import trace
@@ -22,10 +22,10 @@ logger = structlog.get_logger()
 tracer = trace.get_tracer("telegram.handlers")
 
 TODO_CHECKBOX = {
-    "TODO_STATUS_PENDING": "[ ]",
-    "TODO_STATUS_IN_PROGRESS": "[-]",
-    "TODO_STATUS_COMPLETED": "[x]",
-    "TODO_STATUS_BLOCKED": "[!]",
+    "TODO_STATUS_PENDING": "⬜️",
+    "TODO_STATUS_IN_PROGRESS": "⏳",
+    "TODO_STATUS_COMPLETED": "✅",
+    "TODO_STATUS_BLOCKED": "⚠️",
 }
 
 TODO_LABEL = {
@@ -234,20 +234,50 @@ def _normalize_todo_payload(todos_payload: object) -> dict:
     return normalized
 
 
-def _render_todo_list(todos: dict) -> Optional[str]:
-    """Render todos as a checkbox list with statuses."""
+def _render_todo_list(
+    todos: dict, escape_func: Optional[Callable[[str], str]] = None
+) -> Optional[str]:
+    """Render todos as a checkbox list with statuses.
+
+    Optionally apply escape_func to each rendered line for Markdown safety.
+    """
     if not todos:
         return None
 
-    lines = ["📋 TODO"]
-    for todo in sorted(
-        todos.values(), key=lambda t: (str(t.get("createdAt") or ""), t["id"])
-    ):
+    heading = "📋 TODO"
+    if escape_func:
+        heading = escape_func(heading)
+
+    lines = [heading]
+    # Preserve insertion order if already ordered; fallback to timestamp/id sort
+    values = list(todos.values())
+    try:
+        from collections.abc import Mapping
+
+        if isinstance(todos, Mapping) and hasattr(todos, "items"):
+            ordered_values = list(todos.values())
+            if ordered_values:
+                values = ordered_values
+    except Exception:
+        pass
+
+    for todo in values:
         status = todo.get("status", "TODO_STATUS_PENDING")
         checkbox = TODO_CHECKBOX.get(status, "[ ]")
-        label = TODO_LABEL.get(status, status)
         content = todo.get("content") or todo.get("id")
-        lines.append(f"- {checkbox} {content} ({label})")
+        is_done = status == "TODO_STATUS_COMPLETED"
+
+        if escape_func:
+            checkbox = escape_func(checkbox)
+            content = escape_func(content)
+            if is_done:
+                content = f"~{content}~"
+            line = f"\\- {checkbox} {content}"
+        else:
+            if is_done:
+                content = f"~{content}~"
+            line = f"- {checkbox} {content}"
+        lines.append(line)
 
     return "\n".join(lines)
 

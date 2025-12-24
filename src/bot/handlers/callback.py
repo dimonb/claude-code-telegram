@@ -12,7 +12,12 @@ from ...claude.facade import ClaudeIntegration
 from ...config.settings import Settings
 from ...security.audit import AuditLogger
 from ...security.validators import SecurityValidator
-from .message import _format_tool_name, _format_tool_params
+from .message import (
+    _format_tool_name,
+    _format_tool_params,
+    _normalize_todo_payload,
+    _render_todo_list,
+)
 
 logger = structlog.get_logger()
 
@@ -1411,6 +1416,8 @@ async def handle_project_command_callback(
         todos: dict[str, dict] = {}
         thinking_frames = [".", "..", "..."]
         thinking_index = 0
+        thinking_line: Optional[str] = None
+        thinking_thoughts: list[str] = [""]
 
         def _todo_icon(status: str) -> tuple[str, str]:
             """Map todo status to icon and normalized state."""
@@ -1422,7 +1429,7 @@ async def handle_project_command_callback(
             return "⬜️", "pending"
 
         def _update_todos_from_update(update_obj):
-            """Update todos honoring merge flag (default True)."""
+            """Update todos honoring merge flag (default True) using shared renderer."""
             todo_list = None
             merge_flag = True
             metadata = update_obj.metadata or {}
@@ -1442,18 +1449,16 @@ async def handle_project_command_callback(
             if not todo_list:
                 return
 
+            normalized = _normalize_todo_payload(todo_list)
+
             if not merge_flag:
                 todos.clear()
-
-            for item in todo_list:
-                tid = item.get("id") or item.get("content")
-                if not tid:
-                    continue
-                existing = todos.get(tid, {})
-                todos[tid] = {
-                    "content": item.get("content", existing.get("content", "")),
-                    "status": item.get("status", existing.get("status", "TODO_STATUS_PENDING")),
-                }
+                for tid, item in normalized.items():
+                    todos[tid] = item
+            else:
+                # Merge: preserve existing order, update/append in given order
+                for tid, item in normalized.items():
+                    todos[tid] = item
 
         def _build_journal_text() -> str:
             """Render a compact tool journal for the progress message."""
@@ -1477,22 +1482,18 @@ async def handle_project_command_callback(
             return "\n".join(lines)
 
         def _build_todo_text() -> str:
-            """Render todos with strike-through for completed items."""
+            """Render todos with shared renderer (MarkdownV2 escaped)."""
             if not todos:
                 return ""
-
-            lines = ["📝 TODOs"]
-            for item in todos.values():
-                icon, state = _todo_icon(item.get("status"))
-                content = _escape_mdv2(item.get("content", ""))
-                if state == "done":
-                    content = f"~{content}~"
-                lines.append(f"\\- {icon} {content}")
-
-            return "\n".join(lines)
+            return (
+                _render_todo_list(
+                    todos, escape_func=lambda s: escape_markdown(s, version=2)
+                )
+                or ""
+            )
 
         async def stream_handler(update_obj):
-            nonlocal last_progress_text, last_update_time, thinking_index
+            nonlocal last_progress_text, last_update_time, thinking_index, thinking_line, thinking_thoughts
             try:
                 current_time = time.time()
 
@@ -1521,7 +1522,9 @@ async def handle_project_command_callback(
                             tool_order.append(call_id)
 
                     elif update_obj.type == "tool_result" and call_id:
-                        is_error = update_obj.is_error() or metadata.get("status") == "error"
+                        is_error = (
+                            update_obj.is_error() or metadata.get("status") == "error"
+                        )
                         existing = tool_journal.get(call_id, {})
                         if not params:
                             params = existing.get("params", {})
@@ -1559,56 +1562,74 @@ async def handle_project_command_callback(
                     if update_obj.type == "tool_call":
                         tool_name = (update_obj.metadata or {}).get("tool_name", "tool")
                         parts.append("")
-                        parts.append(_escape_mdv2(f"🔧 Running {tool_name.capitalize()}..."))
+                        parts.append(
+                            _escape_mdv2(f"🔧 Running {tool_name.capitalize()}...")
+                        )
                     elif update_obj.type == "tool_result":
                         tool_name = (update_obj.metadata or {}).get("tool_name", "tool")
                         parts.append("")
                         parts.append(_escape_mdv2(f"✅ {tool_name.capitalize()} done"))
 
+                # Handle thinking state
+                local_thinking = None
+
+                if update_obj.type != "thinking" and thinking_thoughts[-1]:
+                    thinking_thoughts.append("")
+
                 # Add assistant or thinking preview
                 if update_obj.type == "assistant" and update_obj.content:
-                    content = update_obj.content.strip()
-                    if content:
-                        if len(content) > 100:
-                            content = content[:100] + "..."
-                        parts.append("")
-                        parts.append(f"💭 {_escape_mdv2(content)}")
+                    local_thinking = _escape_mdv2("🤖 Assistant is working")
                 elif update_obj.type == "thinking":
                     subtype = (update_obj.metadata or {}).get("subtype")
                     if subtype == "delta":
-                        dots = thinking_frames[thinking_index % len(thinking_frames)]
-                        thinking_index += 1
-                        parts.append("")
-                        parts.append(_escape_mdv2(f"💭 Thinking{dots}"))
+                        local_thinking = _escape_mdv2("💭 Thinking")
+                        thinking_thoughts[-1] += update_obj.content
                     else:
                         content = (update_obj.content or "").strip()
                         if content:
-                            parts.append("")
-                            parts.append(f"💭 {_escape_mdv2(content)}")
+                            local_thinking = f"💭 {_escape_mdv2(content)}"
                         else:
-                            parts.append("")
-                            parts.append(_escape_mdv2("💭 Thinking"))
+                            local_thinking = _escape_mdv2("💭 Thinking")
+                elif update_obj.type == "tool_result":
+                    # keep thinking if present but don't add new
+                    pass
+                elif update_obj.type == "result":
+                    thinking_line = None  # clear on final result
                 elif update_obj.type == "error":
                     error_msg = update_obj.get_error_message() or "Error"
                     parts.append("")
                     parts.append(f"❌ {_escape_mdv2(error_msg)}")
+                elif update_obj.type == "system":
+                    local_thinking = _escape_mdv2(
+                        f"⚙️ System: {update_obj.metadata["subtype"]}"
+                    )
+
+                if local_thinking is not None:
+                    thinking_line = local_thinking
+
+                if thinking_line and update_obj.type != "result":
+                    dots = thinking_frames[thinking_index % len(thinking_frames)]
+                    parts.append("")
+                    parts.append(_escape_mdv2(f"{thinking_line}{dots}"))
+                    parts.append("")
+                    parts.append(_escape_mdv2("\n".join(thinking_thoughts[-2:])))
 
                 progress_text = "\n".join(p for p in parts if p is not None)
 
                 # Throttle updates (0.8 seconds minimum)
                 if progress_text and progress_text != last_progress_text:
-                    if current_time - last_update_time >= 0.8:
-                        try:
-                            await progress_msg.edit_text(
-                                progress_text, parse_mode="MarkdownV2"
-                            )
-                            last_progress_text = progress_text
-                            last_update_time = current_time
-                        except BadRequest:
-                            pass  # Message not modified or other issue
+                    if update_obj.type not in {"thinking", "assistant"} or (
+                        current_time - last_update_time >= 0.8
+                    ):
+                        await progress_msg.edit_text(
+                            progress_text, parse_mode="MarkdownV2"
+                        )
+                        last_progress_text = progress_text
+                        thinking_index += 1
+                        last_update_time = current_time
 
             except Exception as e:
-                logger.warning("Stream handler error", error=str(e))
+                logger.exception("Stream handler error", error=str(e))
 
         # Execute the command via Claude integration with streaming
         claude_response = await claude_integration.run_command(
@@ -1633,6 +1654,7 @@ async def handle_project_command_callback(
                     query.message,
                     part,
                     parse_mode="Markdown",
+                    disable_web_page_preview=True,
                 )
 
             # Log success
