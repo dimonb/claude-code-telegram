@@ -50,6 +50,14 @@ def _format_tool_name(tool_name: str) -> str:
     return tool_name.replace("_", " ").title()
 
 
+def _escape_markdown(text: str) -> str:
+    """Escape special characters for Telegram Markdown parse mode."""
+    escape_chars = r"\_*`["
+    for ch in escape_chars:
+        text = text.replace(ch, f"\\{ch}")
+    return text
+
+
 def _format_tool_params(params: dict, max_length: int = 50) -> str:
     """Format tool parameters compactly."""
     if not params:
@@ -105,7 +113,13 @@ def _format_progress_update(
                 icon = entry["icon"]
                 status_text = entry.get("status")
                 status_suffix = f" [{status_text}]" if status_text else ""
-                journal_lines.append(f"{icon} {tool_name}{params_str}{status_suffix}")
+                # Escape Markdown special characters to prevent parsing errors
+                escaped_tool_name = _escape_markdown(tool_name)
+                escaped_params = _escape_markdown(params_str)
+                escaped_status = _escape_markdown(status_suffix)
+                journal_lines.append(
+                    f"{icon} {escaped_tool_name}{escaped_params}{escaped_status}"
+                )
 
     # Format the journal
     journal_text = ""
@@ -135,14 +149,19 @@ def _format_progress_update(
 
         # Fallback if no journal
         display_name = tool_name.capitalize() if tool_name else "Tool"
+        escaped_display_name = _escape_markdown(display_name)
         if update_obj.is_error():
-            return f"❌ **{display_name} failed**\n\n_{update_obj.get_error_message()}_"
+            error_msg = _escape_markdown(
+                update_obj.get_error_message() or "Unknown error"
+            )
+            return f"❌ **{escaped_display_name} failed**\n\n_{error_msg}_"
         else:
-            return f"✅ **{display_name} completed**"
+            return f"✅ **{escaped_display_name} completed**"
 
     elif update_obj.type == "progress":
         # Handle progress updates
-        progress_text = f"🔄 **{update_obj.content or 'Working...'}**"
+        content = _escape_markdown(update_obj.content or "Working...")
+        progress_text = f"🔄 **{content}**"
 
         percentage = update_obj.get_progress_percentage()
         if percentage is not None:
@@ -161,7 +180,8 @@ def _format_progress_update(
 
     elif update_obj.type == "error":
         # Handle error messages
-        return journal_text + f"❌ **Error**\n\n_{update_obj.get_error_message()}_"
+        error_msg = _escape_markdown(update_obj.get_error_message() or "Unknown error")
+        return journal_text + f"❌ **Error**\n\n_{error_msg}_"
 
     elif update_obj.type == "assistant" and update_obj.tool_calls:
         # Tool calls are already shown in journal, just show working status
@@ -174,13 +194,14 @@ def _format_progress_update(
             if len(update_obj.content) > 150
             else update_obj.content
         )
-        return journal_text + f"🤖 **Claude is working...**\n\n_{content_preview}_"
+        escaped_preview = _escape_markdown(content_preview)
+        return journal_text + f"🤖 **Claude is working...**\n\n_{escaped_preview}_"
 
     elif update_obj.type == "system":
         # System initialization or other system messages
         if update_obj.metadata and update_obj.metadata.get("subtype") == "init":
             tools_count = len(update_obj.metadata.get("tools", []))
-            model = update_obj.metadata.get("model", "Claude")
+            model = _escape_markdown(update_obj.metadata.get("model", "Claude"))
             return f"🚀 **Starting {model}** with {tools_count} tools available"
 
     elif update_obj.type == "thinking":
