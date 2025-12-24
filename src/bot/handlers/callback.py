@@ -1,5 +1,6 @@
 """Handle inline keyboard callbacks."""
 
+import asyncio
 import re
 
 import structlog
@@ -1632,12 +1633,30 @@ async def handle_project_command_callback(
                 logger.exception("Stream handler error", error=str(e))
 
         # Execute the command via Claude integration with streaming
-        claude_response = await claude_integration.run_command(
-            prompt=prompt,
-            working_directory=current_dir,
-            user_id=user_id,
-            on_stream=stream_handler,
-        )
+        try:
+            claude_response = await claude_integration.run_command(
+                prompt=prompt,
+                working_directory=current_dir,
+                user_id=user_id,
+                on_stream=stream_handler,
+            )
+        except asyncio.CancelledError:
+            # Task was cancelled due to new message from same user
+            logger.info(
+                "Project command cancelled due to new message",
+                user_id=user_id,
+                command=command_name,
+            )
+            # Try to update progress message
+            try:
+                await progress_msg.edit_text(
+                    "⏹️ **Command cancelled**\n\n"
+                    "Previous command was cancelled due to a new message.",
+                    parse_mode="MarkdownV2",
+                )
+            except Exception:
+                pass
+            return
 
         # Update session ID in context if we got one
         if claude_response and claude_response.session_id:

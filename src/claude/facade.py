@@ -3,6 +3,7 @@
 Provides simple interface for bot handlers.
 """
 
+import asyncio
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Union
 
@@ -74,6 +75,9 @@ class ClaudeIntegration:
         self.session_manager = session_manager
         self.tool_monitor = tool_monitor
 
+        # Track active tasks per user to allow cancellation
+        self.active_tasks: Dict[int, asyncio.Task] = {}
+
     async def run_command(
         self,
         prompt: str,
@@ -90,6 +94,27 @@ class ClaudeIntegration:
             session_id=session_id,
             prompt_length=len(prompt),
         )
+
+        # Cancel previous task for this user if exists
+        if user_id in self.active_tasks:
+            previous_task = self.active_tasks[user_id]
+            if not previous_task.done():
+                logger.info(
+                    "Cancelling previous task for user",
+                    user_id=user_id,
+                    task_done=previous_task.done(),
+                )
+                previous_task.cancel()
+                try:
+                    await previous_task
+                except asyncio.CancelledError:
+                    logger.debug("Previous task cancelled successfully", user_id=user_id)
+                except Exception as e:
+                    logger.warning(
+                        "Error while cancelling previous task",
+                        user_id=user_id,
+                        error=str(e),
+                    )
 
         # Get or create session
         session = await self.session_manager.get_or_create_session(
@@ -176,13 +201,37 @@ class ClaudeIntegration:
                     else session.session_id
                 )
 
-                response = await self._execute(
-                    prompt=prompt,
-                    working_directory=working_directory,
-                    session_id=claude_session_id,
-                    continue_session=should_continue,
-                    stream_callback=stream_handler,
-                )
+                # Create task for execution to allow cancellation
+                async def execute_wrapper():
+                    return await self._execute(
+                        prompt=prompt,
+                        working_directory=working_directory,
+                        session_id=claude_session_id,
+                        continue_session=should_continue,
+                        stream_callback=stream_handler,
+                    )
+
+                task = asyncio.create_task(execute_wrapper())
+                self.active_tasks[user_id] = task
+
+                try:
+                    response = await task
+                except asyncio.CancelledError:
+                    logger.info("Task cancelled", user_id=user_id)
+                    # Try to kill active processes for this user
+                    try:
+                        await self.manager.kill_all_processes()
+                    except Exception as kill_error:
+                        logger.warning(
+                            "Failed to kill processes after cancellation",
+                            user_id=user_id,
+                            error=str(kill_error),
+                        )
+                    raise
+                finally:
+                    # Clean up task tracking
+                    if user_id in self.active_tasks and self.active_tasks[user_id] == task:
+                        del self.active_tasks[user_id]
 
                 # Check if tool validation failed
                 if not tools_validated:

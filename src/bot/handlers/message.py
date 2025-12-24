@@ -676,6 +676,18 @@ async def handle_text_message(
                         f"{formatted_messages[-1].text}\n\n{todo_text}"
                     )
 
+            except asyncio.CancelledError:
+                # Task was cancelled due to new message from same user
+                logger.info(
+                    "Claude command cancelled due to new message",
+                    user_id=user_id,
+                )
+                # Delete progress message and return early - new message will be processed
+                try:
+                    await progress_msg.delete()
+                except Exception:
+                    pass
+                return
             except ClaudeToolValidationError as e:
                 # Tool validation error with detailed instructions
                 logger.error(
@@ -1100,11 +1112,22 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                         ),
                     )
 
-                    if i < len(formatted_messages) - 1:
-                        await asyncio.sleep(0.5)
+                        if i < len(formatted_messages) - 1:
+                            await asyncio.sleep(0.5)
 
-            except Exception as claude_error:
-                await claude_progress_msg.edit_text(
+                except asyncio.CancelledError:
+                    # Task was cancelled due to new message from same user
+                    logger.info(
+                        "Photo processing cancelled due to new message",
+                        user_id=user_id,
+                    )
+                    try:
+                        await claude_progress_msg.delete()
+                    except Exception:
+                        pass
+                    return
+                except Exception as claude_error:
+                    await claude_progress_msg.edit_text(
                     _format_error_message(str(claude_error)),
                     parse_mode="Markdown",
                 )
@@ -1263,6 +1286,17 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                         if i < len(formatted_messages) - 1:
                             await asyncio.sleep(0.5)
 
+                except asyncio.CancelledError:
+                    # Task was cancelled due to new message from same user
+                    logger.info(
+                        "Document processing cancelled due to new message",
+                        user_id=user_id,
+                    )
+                    try:
+                        await claude_progress_msg.delete()
+                    except Exception:
+                        pass
+                    return
                 except Exception as claude_error:
                     await claude_progress_msg.edit_text(
                         _format_error_message(str(claude_error)),
