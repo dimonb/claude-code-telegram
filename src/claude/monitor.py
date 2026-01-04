@@ -32,6 +32,23 @@ class ToolMonitor:
         self.tool_usage: Dict[str, int] = defaultdict(int)
         self.security_violations: List[Dict[str, Any]] = []
 
+        # Cache normalized sets for case-insensitive lookup
+        self._allowed_tools_norm: Optional[set[str]] = None
+        if (
+            hasattr(self.config, "claude_allowed_tools")
+            and self.config.claude_allowed_tools
+        ):
+            self._allowed_tools_norm = {t.lower() for t in self.config.claude_allowed_tools}
+
+        self._disallowed_tools_norm: Optional[set[str]] = None
+        if (
+            hasattr(self.config, "claude_disallowed_tools")
+            and self.config.claude_disallowed_tools
+        ):
+            self._disallowed_tools_norm = {
+                t.lower() for t in self.config.claude_disallowed_tools
+            }
+
     async def validate_tool_call(
         self,
         tool_name: str,
@@ -51,12 +68,11 @@ class ToolMonitor:
             user_id=user_id,
         )
 
+        tool_name_lower = tool_name.lower()
+
         # Check if tool is allowed
-        if (
-            hasattr(self.config, "claude_allowed_tools")
-            and self.config.claude_allowed_tools
-        ):
-            if tool_name not in self.config.claude_allowed_tools:
+        if self._allowed_tools_norm is not None:
+            if tool_name_lower not in self._allowed_tools_norm:
                 violation = {
                     "type": "disallowed_tool",
                     "tool_name": tool_name,
@@ -68,11 +84,8 @@ class ToolMonitor:
                 return False, f"Tool not allowed: {tool_name}"
 
         # Check if tool is explicitly disallowed
-        if (
-            hasattr(self.config, "claude_disallowed_tools")
-            and self.config.claude_disallowed_tools
-        ):
-            if tool_name in self.config.claude_disallowed_tools:
+        if self._disallowed_tools_norm is not None:
+            if tool_name_lower in self._disallowed_tools_norm:
                 violation = {
                     "type": "explicitly_disallowed_tool",
                     "tool_name": tool_name,
@@ -84,13 +97,13 @@ class ToolMonitor:
                 return False, f"Tool explicitly disallowed: {tool_name}"
 
         # Validate file operations
-        if tool_name in [
+        if tool_name_lower in [
             "create_file",
             "edit_file",
             "read_file",
-            "Write",
-            "Edit",
-            "Read",
+            "write",
+            "edit",
+            "read",
         ]:
             file_path = tool_input.get("path") or tool_input.get("file_path")
             if not file_path:
@@ -118,7 +131,7 @@ class ToolMonitor:
         # Validate shell commands
         # NOTE: This validation is secondary to SecurityHooks in the SDK
         # Only block truly dangerous patterns, not common shell operators
-        if tool_name in ["bash", "shell", "Bash"]:
+        if tool_name_lower in ["bash", "shell"]:
             command = tool_input.get("command", "")
 
             # Check for truly dangerous commands only
@@ -183,20 +196,16 @@ class ToolMonitor:
 
     def is_tool_allowed(self, tool_name: str) -> bool:
         """Check if tool is allowed without validation."""
+        tool_name_lower = tool_name.lower()
+
         # Check allowed list
-        if (
-            hasattr(self.config, "claude_allowed_tools")
-            and self.config.claude_allowed_tools
-        ):
-            if tool_name not in self.config.claude_allowed_tools:
+        if self._allowed_tools_norm is not None:
+            if tool_name_lower not in self._allowed_tools_norm:
                 return False
 
         # Check disallowed list
-        if (
-            hasattr(self.config, "claude_disallowed_tools")
-            and self.config.claude_disallowed_tools
-        ):
-            if tool_name in self.config.claude_disallowed_tools:
+        if self._disallowed_tools_norm is not None:
+            if tool_name_lower in self._disallowed_tools_norm:
                 return False
 
         return True
